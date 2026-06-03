@@ -1,14 +1,16 @@
 import os
 import re
+import jwt
 import json
 import html
 from datetime import datetime, timezone
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, BackgroundTasks, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
-from services import AgentEngine
-from utils import  build_prompt
+from services import AgentEngine, GeminiAgentEngine
+from services.github_service import sync_github_repositories
+from utils.prompt_builder import build_prompt
 from typing import Optional, List
 from pydantic import BaseModel
 from services import get_or_create_session, get_messages, get_session, save_message
@@ -16,16 +18,21 @@ from services.mongo_service import products_col, brands_col, categories_col, pro
 from bson import ObjectId
 
 load_dotenv()
+JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-jwt-key-aimer-future-2026-06-02")
+JWT_ALGORITHM = "HS256"
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://amamiyakun02.github.io",
         "https://smart-guide-ai-agent.vercel.app",
+        "https://lina-deals.vercel.app",
     ],
     allow_origin_regex=r"https://.*\.trycloudflare\.com",
     allow_credentials=True,
@@ -34,10 +41,55 @@ app.add_middleware(
 )
 
 agent_robin = AgentEngine(persona_file="agents/robin.json")
-agent_luna = AgentEngine(persona_file="agents/Luna.json")
+agent_lina = AgentEngine(persona_file="agents/Lina.json")
+agent_gemini = GeminiAgentEngine(persona_file="agents/robin.json")
 
 from routers.admin_api import router as admin_router
 app.include_router(admin_router)
+
+from routers.auth_api import router as auth_router
+app.include_router(auth_router)
+
+# ──────────────────────────────────────────────
+# GLOBAL EXCEPTION HANDLERS (Manual CORS headers injection)
+# ──────────────────────────────────────────────
+from fastapi import Request
+from fastapi.exceptions import HTTPException as FastAPIHTTPException
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+def add_cors_headers(request: Request, response: JSONResponse) -> JSONResponse:
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+@app.exception_handler(StarletteHTTPException)
+@app.exception_handler(FastAPIHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+    return add_cors_headers(request, response)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    error_trace = traceback.format_exc()
+    print("[CRITICAL ERROR] Unhandled exception occurred:")
+    print(error_trace)
+    response = JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"Internal Server Error: {str(exc)}",
+            "type": exc.__class__.__name__,
+            "traceback": error_trace
+        }
+    )
+    return add_cors_headers(request, response)
 
 @app.on_event("startup")
 async def startup_event():
@@ -46,6 +98,34 @@ async def startup_event():
         await initialize_qdrant_collections()
     except Exception as e:
         print(f"[ERROR] Error during Qdrant startup initialization: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("[SHUTDOWN] Closing database and cache connections...")
+    try:
+        from services.redis_service import close_redis_connection
+        await close_redis_connection()
+        print("[SHUTDOWN] Redis connection closed successfully.")
+    except Exception as e:
+        print(f"[SHUTDOWN ERROR] Failed to close Redis: {e}")
+
+    try:
+        from services.mongo_service import mongo_client
+        mongo_client.close()
+        print("[SHUTDOWN] MongoDB connection closed successfully.")
+    except Exception as e:
+        print(f"[SHUTDOWN ERROR] Failed to close MongoDB: {e}")
+
+@app.post("/v1/github/sync")
+async def trigger_github_sync(background_tasks: BackgroundTasks):
+    """
+    Trigger manual synchronization of GitHub repositories in the background.
+    """
+    background_tasks.add_task(sync_github_repositories)
+    return {
+        "status": "success",
+        "message": "GitHub synchronization has been started in the background."
+    }
 
 @app.get("/")
 async def root():
@@ -331,10 +411,71 @@ async def assistant_chat(payload: ChatRequest = Body(...)):
     return await process_chat(payload, agent_robin)
 
 @app.post("/v1/agent/chat")
-async def agent_chat(payload: ChatRequest = Body(...)):
-    return await process_chat(payload, agent_luna)
+async def agent_chat(
+    payload: ChatRequest = Body(...),
+    authorization: Optional[str] = Header(None)
+):
+    # Jika header Authorization dikirimkan, verifikasi token JWT
+    if authorization:
+        try:
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(status_code=401, detail="Format header otorisasi harus Bearer <token>")
+            
+            token = authorization.split(" ")[1]
+            try:
+                decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                user_id = decoded.get("id")
+                if not user_id:
+                    raise HTTPException(status_code=401, detail="Token tidak valid: ID Pengguna tidak ditemukan.")
+                
+                # Periksa status aktif user di Redis/MongoDB untuk keamanan tambahan
+                from services.redis_service import redis_client
+                from services.mongo_service import users_col
+                from bson import ObjectId
+                try:
+                    cache_key = f"user_status:{user_id}"
+                    cached_status = await redis_client.get(cache_key)
+                    if cached_status:
+                        status_data = json.loads(cached_status)
+                        is_active = status_data.get("is_active", True)
+                        exists = status_data.get("exists", True)
+                        if not exists:
+                            raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
+                        if not is_active:
+                            raise HTTPException(status_code=403, detail="Akun Anda dinonaktifkan oleh administrator.")
+                    else:
+                        user_doc = await users_col.find_one({"_id": ObjectId(user_id)})
+                        if not user_doc:
+                            await redis_client.setex(cache_key, 300, json.dumps({"exists": False}))
+                            raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
+                        
+                        is_active = user_doc.get("is_active", True)
+                        await redis_client.setex(cache_key, 300, json.dumps({"exists": True, "is_active": is_active}))
+                        
+                        if not is_active:
+                            raise HTTPException(status_code=403, detail="Akun Anda dinonaktifkan oleh administrator.")
+                except HTTPException as he:
+                    raise he
+                except Exception:
+                    # Abaikan error format ObjectId agar tidak memblokir sesi tamu
+                    pass
+                    
+            except jwt.ExpiredSignatureError:
+                raise HTTPException(status_code=401, detail="Sesi masuk Anda telah kadaluarsa. Silakan masuk kembali.")
+            except jwt.InvalidTokenError as e:
+                raise HTTPException(status_code=401, detail=f"Otentikasi gagal: {e}")
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Otorisasi gagal: {str(e)}")
 
-async def process_chat(payload: ChatRequest, current_agent: AgentEngine):
+    return await process_chat(payload, agent_lina)
+
+@app.post("/v1/gemini/chat")
+async def gemini_chat(payload: ChatRequest = Body(...)):
+    return await process_chat(payload, agent_gemini)
+
+async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine):
     try:
         messages = payload.messages or []
         user_id = payload.user_id
@@ -359,16 +500,52 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine):
         conversation = await get_messages(session_id=session_id, limit=30)
         history_messages = format_conversation(conversation) or []
 
-        # ambil ulang session (optional, tapi aman)
-        session = await get_session(session_id) or {}
 
+
+        # ======================
+        # RAG RETRIEVAL (QDRANT SEMANTIC SEARCH)
+        # ======================
         retrieval = [""]
+        try:
+            from services.rag_service import search_documents
+            retrieval_contexts = await search_documents(messages[-1].content, limit=3)
+            if retrieval_contexts:
+                retrieval = retrieval_contexts
+        except Exception as e:
+            print(f"[RAG SEARCH WARNING] Failed to retrieve context: {e}")
+
+        # Fetch complete registered user info if logged in (not anonymous)
+        user_info = None
+        user_id_str = session.get("user_id")
+        if user_id_str and not str(user_id_str).startswith("guest"):
+            try:
+                from services.mongo_service import users_col
+                from bson import ObjectId
+                
+                user_doc = None
+                try:
+                    user_doc = await users_col.find_one({"_id": ObjectId(user_id_str)})
+                except Exception:
+                    pass
+                
+                if not user_doc:
+                    user_doc = await users_col.find_one({"_id": user_id_str})
+                    
+                if user_doc:
+                    user_info = {
+                        "name": user_doc.get("name"),
+                        "phone": user_doc.get("phone"),
+                        "email": user_doc.get("email"),
+                    }
+            except Exception as e:
+                print(f"[ERROR] Failed to fetch user info for prompt: {e}")
 
         prompt = build_prompt(
             session=session,
             history=history_messages,
             retrieval=retrieval,
-            new_input=messages[0].content,
+            new_input=messages[-1].content,
+            user_info=user_info
         )
         
         # ======================
@@ -378,7 +555,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine):
             full_response = ""
 
             try:
-                async for chunk in current_agent.chat(prompt, lang=payload.lang):
+                async for chunk in current_agent.chat(prompt, lang=payload.lang, session_id=session_id):
 
                     text_part = ""
 
