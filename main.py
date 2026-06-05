@@ -17,10 +17,16 @@ from services import get_or_create_session, get_messages, get_session, save_mess
 from services.mongo_service import products_col, brands_col, categories_col, product_variants_col
 from bson import ObjectId
 
+from fastapi.staticfiles import StaticFiles
 load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-jwt-key-aimer-future-2026-06-02")
 JWT_ALGORITHM = "HS256"
 app = FastAPI()
+
+# Mount folder public untuk menyimpan & memutar anime secara lokal
+os.makedirs("public/anime", exist_ok=True)
+app.mount("/public", StaticFiles(directory="public"), name="public")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -44,11 +50,26 @@ agent_robin = AgentEngine(persona_file="agents/robin.json")
 agent_lina = AgentEngine(persona_file="agents/Lina.json")
 agent_gemini = GeminiAgentEngine(persona_file="agents/robin.json")
 
+@app.on_event("startup")
+async def startup_event():
+    import asyncio
+    from services.agent_service import get_mcp_tools
+    # Pre-fetch and cache MCP tools concurrently during server startup
+    asyncio.create_task(get_mcp_tools())
+
 from routers.admin_api import router as admin_router
 app.include_router(admin_router)
 
 from routers.auth_api import router as auth_router
 app.include_router(auth_router)
+
+from routers.pdf_api import router as pdf_router
+app.include_router(pdf_router)
+
+from routers.anime_api import router as anime_router
+app.include_router(anime_router)
+
+
 
 # ──────────────────────────────────────────────
 # GLOBAL EXCEPTION HANDLERS (Manual CORS headers injection)
@@ -91,13 +112,38 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
     return add_cors_headers(request, response)
 
+async def keep_alive_spaces():
+    import httpx
+    import asyncio
+    urls = [
+        "https://amamiya-kun-removebg.hf.space/",
+        "https://amamiya-kun-palmscan.hf.space/"
+    ]
+    await asyncio.sleep(10)  # Wait 10 seconds for main server startup to settle
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                for url in urls:
+                    try:
+                        res = await client.get(url, timeout=10.0)
+                        print(f"[KEEP-ALIVE] Pinged {url} - Status: {res.status_code}")
+                    except Exception as e:
+                        print(f"[KEEP-ALIVE WARNING] Failed to ping {url}: {e}")
+        except Exception as e:
+            print(f"[KEEP-ALIVE WARNING] HTTP client initialization failed: {e}")
+        await asyncio.sleep(1500)  # 25 minutes interval
+
 @app.on_event("startup")
 async def startup_event():
+    import asyncio
     try:
         from services.rag_ingestion_service import initialize_qdrant_collections
         await initialize_qdrant_collections()
     except Exception as e:
         print(f"[ERROR] Error during Qdrant startup initialization: {e}")
+    
+    # Run the keep-alive background task
+    asyncio.create_task(keep_alive_spaces())
 
 @app.on_event("shutdown")
 async def shutdown_event():
