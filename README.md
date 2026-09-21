@@ -276,36 +276,10 @@ Proyek ini bisa di-deploy ke:
 **Amamiya (Maireza)** — AI Application & Automation Engineer
 
 - 📱 WhatsApp: `083863450720`
-- 📸 Instagram: `snakezz.nihility__4.0.1`
+- 📸 Instagram: `_agonystic_`
 - 💻 GitHub: `amamiyakun02`
 - 🌐 Website: [amamiyakun02.github.io](https://amamiyakun02.github.io)
 
 > *"Build once, useful forever"*
 
 ---
-
-## 📄 Lisensi
-
-Proyek ini bersifat privat/personal. Semua hak cipta dilindungi oleh Amamiya (Maireza).
-
----
-
-## 🗂️ `.gitignore`
-
-File dan folder berikut sengaja **tidak di-push** ke GitHub untuk menjaga keamanan dan kinerja repositori:
-
-| Entry | Alasan |
-|-------|--------|
-| `.env`, `.env.*` | Credentials & environment variables sensitif |
-| `.venv/`, `__pycache__/` | Virtual environment & cache Python |
-| `firebase-key.json` | Firebase service account credentials |
-| `.fastapicloud/` | Cloud deployment configuration |
-| `models/` | Large AI/ML model files |
-| `memory/` | User conversation data |
-| `document/` | Documentation & profile files |
-| `deploy_pkg/` | Deployment artifacts |
-| `uv.lock` | Lock file dependency version |
-| `*.log`, `*.sqlite`, `*.db` | Local logs & databases |
-| `.vscode/`, `.idea/` | IDE configuration files |
-
-Lihat file [.gitignore](./.gitignore) untuk daftar lengkap.
