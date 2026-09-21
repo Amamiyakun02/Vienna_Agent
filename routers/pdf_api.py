@@ -4,7 +4,7 @@ import tempfile
 import numpy as np
 import fitz  # PyMuPDF
 from typing import List, Optional
-from fastapi import APIRouter, UploadFile, File, Query, HTTPException, status, Response
+from fastapi import APIRouter, UploadFile, File, Query, Form, HTTPException, status, Response
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/v1/pdf", tags=["PDF Analysis"])
@@ -230,6 +230,97 @@ async def convert_images_to_pdf(
             headers={
                 "Content-Disposition": "attachment; filename=images_converted.pdf"
             }
+        )
+    finally:
+        doc.close()
+
+
+def parse_pages(pages_str: str, max_pages: int) -> List[int]:
+    """
+    Parses a string representation of page numbers/ranges (e.g. "1, 3, 5-8")
+    into a sorted list of unique 1-indexed page integers, validated against max_pages.
+    """
+    pages = set()
+    parts = pages_str.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            subparts = part.split("-")
+            if len(subparts) == 2:
+                try:
+                    start = int(subparts[0].strip())
+                    end = int(subparts[1].strip())
+                    if start <= end:
+                        for p in range(start, end + 1):
+                            if 1 <= p <= max_pages:
+                                pages.add(p)
+                except ValueError:
+                    pass
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= max_pages:
+                    pages.add(p)
+            except ValueError:
+                pass
+    return sorted(list(pages))
+
+
+@router.post("/cut")
+async def cut_pdf(
+    file: UploadFile = File(...),
+    pages: str = Form(...)
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tipe file tidak valid. Hanya file PDF yang diperbolehkan."
+        )
+
+    content = await file.read()
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Gagal membuka dokumen PDF: {str(e)}"
+        )
+
+    try:
+        total_pages = len(doc)
+        indices = parse_pages(pages, total_pages)
+        if not indices:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Tidak ada halaman valid yang dipilih untuk dipotong."
+            )
+
+        new_doc = fitz.open()
+        for idx in indices:
+            new_doc.insert_pdf(doc, from_page=idx - 1, to_page=idx - 1)
+
+        pdf_bytes = new_doc.write()
+        new_doc.close()
+
+        # Generate output filename
+        orig_base = os.path.splitext(file.filename)[0]
+        out_filename = f"{orig_base}_cut.pdf"
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={out_filename}"
+            }
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Terjadi kesalahan saat memotong file PDF: {str(e)}"
         )
     finally:
         doc.close()

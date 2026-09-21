@@ -1,4 +1,5 @@
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import re
 import jwt
 import json
@@ -11,21 +12,21 @@ from dotenv import load_dotenv
 from services import AgentEngine, GeminiAgentEngine
 from services.github_service import sync_github_repositories
 from utils.prompt_builder import build_prompt
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from services import get_or_create_session, get_messages, get_session, save_message
-from services.mongo_service import products_col, brands_col, categories_col, product_variants_col
 from bson import ObjectId
+from fastapi import WebSocket, WebSocketDisconnect
+from services.connection_manager import manager
+from services.mongo_service import devices_col, device_app_inventory_col
+from services.redis_service import redis_client
+
 
 from fastapi.staticfiles import StaticFiles
 load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-jwt-key-aimer-future-2026-06-02")
 JWT_ALGORITHM = "HS256"
 app = FastAPI()
-
-# Mount folder public untuk menyimpan & memutar anime secara lokal
-os.makedirs("public/anime", exist_ok=True)
-app.mount("/public", StaticFiles(directory="public"), name="public")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,9 +47,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-agent_robin = AgentEngine(persona_file="agents/robin.json")
-agent_lina = AgentEngine(persona_file="agents/Lina.json")
-agent_gemini = GeminiAgentEngine(persona_file="agents/robin.json")
+agent_vienna = AgentEngine(persona_file="agents/vienna.json")
+agent_gemini = GeminiAgentEngine(persona_file="agents/vienna.json")
 
 @app.on_event("startup")
 async def startup_event():
@@ -57,8 +57,6 @@ async def startup_event():
     # Pre-fetch and cache MCP tools concurrently during server startup
     asyncio.create_task(get_mcp_tools())
 
-from routers.admin_api import router as admin_router
-app.include_router(admin_router)
 
 from routers.auth_api import router as auth_router
 app.include_router(auth_router)
@@ -69,6 +67,14 @@ app.include_router(pdf_router)
 from routers.anime_api import router as anime_router
 app.include_router(anime_router)
 
+from routers.spotify_api import router as spotify_router
+app.include_router(spotify_router)
+
+from routers.admin import router as admin_router
+app.include_router(admin_router)
+
+from routers.gemini_live import router as gemini_live_router
+app.include_router(gemini_live_router)
 
 
 # ──────────────────────────────────────────────
@@ -117,7 +123,8 @@ async def keep_alive_spaces():
     import asyncio
     urls = [
         "https://amamiya-kun-removebg.hf.space/",
-        "https://amamiya-kun-palmscan.hf.space/"
+        "https://amamiya-kun-viennago.hf.space/",
+        # "https://amamiya-kun-palmscan.hf.space/"
     ]
     await asyncio.sleep(10)  # Wait 10 seconds for main server startup to settle
     while True:
@@ -173,231 +180,131 @@ async def trigger_github_sync(background_tasks: BackgroundTasks):
         "message": "GitHub synchronization has been started in the background."
     }
 
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
 
+# ──────────────────────────────────────────────
+# PRIVATE AI AGENT DEVICE API & WEBSOCKET ENDPOINTS
+# ──────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Quick-Prompt Suggestions — dapat diedit di sini tanpa menyentuh frontend
-# ---------------------------------------------------------------------------
-QUICK_PROMPTS_ID = [
-    {
-        "id": "gaming",
-        "icon": "🎮",
-        "title": "Rekomendasi HP Gaming",
-        "description": "Cari smartphone performa tinggi untuk gaming budget di bawah 5 juta.",
-        "prompt": "Bisa rekomendasikan smartphone untuk gaming dengan budget di bawah 5 juta?",
-        "color": "indigo",
-    },
-    {
-        "id": "flagship",
-        "icon": "⚖️",
-        "title": "Bandingkan Flagship",
-        "description": "Perbandingan spesifikasi antara iPhone 15 Pro dan Samsung Galaxy S24 Ultra.",
-        "prompt": "Apa perbedaan spesifikasi dan keunggulan antara iPhone 15 Pro dengan Samsung Galaxy S24 Ultra?",
-        "color": "emerald",
-    },
-    {
-        "id": "budget",
-        "icon": "💸",
-        "title": "HP Terbaik 2 Jutaan",
-        "description": "Cari smartphone terbaik dan terkini dengan budget maksimal 2 juta.",
-        "prompt": "Rekomendasikan HP terbaik yang ada di toko dengan budget maksimal 2 juta rupiah.",
-        "color": "violet",
-    },
-    {
-        "id": "camera",
-        "icon": "📸",
-        "title": "HP Kamera Terbaik",
-        "description": "Smartphone dengan kamera terbaik untuk foto dan video profesional.",
-        "prompt": "HP apa yang punya kamera terbaik di toko Aimer untuk fotografi dan video?",
-        "color": "rose",
-    },
-]
+class RegisterDeviceRequest(BaseModel):
+    user_id: str
+    device_id: str
+    fcm_token: str
 
-QUICK_PROMPTS_EN = [
-    {
-        "id": "gaming",
-        "icon": "🎮",
-        "title": "Gaming Phone Picks",
-        "description": "Find high-performance smartphones for gaming under 5 million IDR.",
-        "prompt": "Can you recommend a smartphone for gaming with a budget under 5 million IDR?",
-        "color": "indigo",
-    },
-    {
-        "id": "flagship",
-        "icon": "⚖️",
-        "title": "Compare Flagships",
-        "description": "Compare specs between iPhone 15 Pro and Samsung Galaxy S24 Ultra.",
-        "prompt": "What are the spec differences and advantages between iPhone 15 Pro and Samsung Galaxy S24 Ultra?",
-        "color": "emerald",
-    },
-    {
-        "id": "budget",
-        "icon": "💸",
-        "title": "Best Phone under 2M",
-        "description": "Find the best and latest smartphones with a maximum budget of 2 million IDR.",
-        "prompt": "Recommend the best phone available in the store with a maximum budget of 2 million IDR.",
-        "color": "violet",
-    },
-    {
-        "id": "camera",
-        "icon": "📸",
-        "title": "Best Camera Phone",
-        "description": "Smartphones with the best camera for professional photos and videos.",
-        "prompt": "Which phone has the best camera in the Aimer store for photography and video?",
-        "color": "rose",
-    },
-]
+class RegisterDeviceResponse(BaseModel):
+    status: str
+    message: str
 
-@app.get("/v1/agent/quick-prompts")
-async def get_quick_prompts(lang: Optional[str] = "id"):
-    """
-    Mengembalikan daftar quick-prompt suggestion yang ditampilkan di halaman awal chatbot.
-    Data dapat dikonfigurasi langsung di variabel QUICK_PROMPTS pada main.py.
-    """
-    if lang == "en":
-        return {"prompts": QUICK_PROMPTS_EN}
-    return {"prompts": QUICK_PROMPTS_ID}
-
-
-@app.get("/v1/products/batch")
-async def get_products_batch(ids: str):
-    """
-    Mengambil batch data produk dari MongoDB Atlas berdasarkan daftar ID terpisah koma,
-    lalu me-resolve brand, kategori, spesifikasi, dan warna HEX untuk dikirimkan ke frontend.
-    """
-    id_list = [i.strip() for i in ids.split(",") if i.strip()]
-    if not id_list:
-        return {"items": []}
-
-    mongo_ids = []
-    for pid in id_list:
-        try:
-            if len(pid) == 24:
-                mongo_ids.append(ObjectId(pid))
-            else:
-                mongo_ids.append(pid)
-        except Exception:
-            mongo_ids.append(pid)
-
+@app.post("/v1/device/register", response_model=RegisterDeviceResponse)
+async def register_device(payload: RegisterDeviceRequest):
     try:
-        cursor = products_col.find({"_id": {"$in": mongo_ids}})
-        raw_products = await cursor.to_list(length=len(mongo_ids))
-    except Exception as e:
-        return {"items": [], "error": f"Database query failed: {e}"}
-
-    # Urutkan hasil agar sesuai dengan urutan ID yang di-request oleh user
-    product_map = {str(p["_id"]): p for p in raw_products}
-    ordered_products = [product_map[pid] for pid in id_list if pid in product_map]
-
-    items = []
-
-    def _format_rupiah(price: float) -> str:
-        try:
-            return f"Rp {int(price):,}".replace(",", ".")
-        except Exception:
-            return str(price)
-
-    def _safe_str(val) -> str:
-        if val is None:
-            return ""
-        if isinstance(val, list):
-            return ", ".join(str(v) for v in val if v)
-        return str(val)
-
-    async def _resolve_name(col, field_id: str) -> str:
-        try:
-            if len(field_id) == 24:
-                doc = await col.find_one({"_id": ObjectId(field_id)})
-            else:
-                doc = None
-            if not doc:
-                doc = await col.find_one({"$or": [{"name": field_id}, {"slug": field_id}]})
-            return doc.get("name", field_id) if doc else field_id
-        except Exception:
-            return field_id
-
-    for p in ordered_products:
-        pid_str = str(p.get("_id", ""))
-        brand_id = _safe_str(p.get("brand_id", ""))
-        brand_name = await _resolve_name(brands_col, brand_id) if brand_id else "Unknown"
-
-        cat_id = _safe_str(p.get("category_id", ""))
-        cat_name = await _resolve_name(categories_col, cat_id) if cat_id else ""
-
-        specs_raw = p.get("specs") or {}
-        specs = {
-            "screen":    _safe_str(specs_raw.get("display") or specs_raw.get("screen", "-")),
-            "processor": _safe_str(specs_raw.get("processor", "-")),
-            "camera":    _safe_str(specs_raw.get("camera_main") or specs_raw.get("camera", "-")),
-            "battery":   _safe_str(specs_raw.get("battery", "-")),
-        }
-
-        tags = []
-        if cat_name:
-            tags.append(cat_name)
-        if specs_raw.get("five_g") or specs_raw.get("5g"):
-            tags.append("5G")
-        if specs_raw.get("nfc"):
-            tags.append("NFC")
-        if not tags:
-            tags.append("Toko Aimer")
-
-        base_price = p.get("base_price", 0)
-        price_str = _format_rupiah(base_price)
-
-        images = p.get("images") or []
-        image_url = images[0] if images else (
-            f"https://placehold.co/300x300/e2e8f0/475569?text={p.get('name','Product')[:12].replace(' ','+')}"
+        await devices_col.update_one(
+            {"user_id": payload.user_id, "device_id": payload.device_id},
+            {"$set": {
+                "fcm_token": payload.fcm_token,
+                "updated_at": datetime.now(timezone.utc)
+            }},
+            upsert=True
         )
+        return {"status": "success", "message": "Device token registered successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to register device: {str(e)}")
 
-        colors = []
+class ActionResultRequest(BaseModel):
+    tool_call_id: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
+
+@app.post("/v1/device/action-result")
+async def device_action_result(payload: ActionResultRequest):
+    try:
+        # Save result to Redis for agent waiting loop
+        await redis_client.set(f"tool_result:{payload.tool_call_id}", payload.model_dump_json(), ex=60)
+        return {"status": "success", "message": "Action result relayed."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to relay action result: {str(e)}")
+
+@app.websocket("/v1/assistant/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    user_id = None
+    try:
+        await websocket.accept()
+        init_data = await websocket.receive_text()
+        init_json = json.loads(init_data)
+        
+        if init_json.get("type") == "register":
+            user_id = init_json.get("user_id")
+            display_name = init_json.get("display_name", "")
+            device_id = init_json.get("device_id", "default_device")
+            fcm_token = init_json.get("fcm_token")
+            
+            if not user_id:
+                await websocket.send_text(json.dumps({"error": "Missing user_id"}))
+                await websocket.close(1008)
+                return
+                
+            await manager.connect(user_id, websocket)
+            
+            if fcm_token:
+                await devices_col.update_one(
+                    {"user_id": user_id, "device_id": device_id},
+                    {"$set": {
+                        "fcm_token": fcm_token,
+                        "updated_at": datetime.now(timezone.utc)
+                    }},
+                    upsert=True
+                )
+            
+            await websocket.send_text(json.dumps({"type": "registered", "status": "success"}))
+            log_name = f"{display_name} ({user_id})" if display_name else user_id
+            print(f"[WS] Registered connection for user {log_name} (device: {device_id})")
+        else:
+            await websocket.send_text(json.dumps({"error": "First message must be registration"}))
+            await websocket.close(1008)
+            return
+
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            print(f"[WS] Message received from user {user_id}: {message}")
+            
+            if message.get("type") == "sync_inventory":
+                apps = message.get("apps", [])
+                device_id = message.get("device_id", "default_device")
+                await device_app_inventory_col.update_one(
+                    {"user_id": user_id, "device_id": device_id},
+                    {"$set": {
+                        "apps": apps,
+                        "updated_at": datetime.now(timezone.utc)
+                    }},
+                    upsert=True
+                )
+                print(f"[WS] Synced {len(apps)} apps for user {user_id}")
+                await websocket.send_text(json.dumps({
+                    "type": "sync_inventory_response",
+                    "status": "success"
+                }))
+                
+            elif "tool_call_id" in message and "status" in message:
+                tool_call_id = message["tool_call_id"]
+                await redis_client.set(f"tool_result:{tool_call_id}", json.dumps(message), ex=60)
+                print(f"[WS] Relayed result for tool call {tool_call_id} to Redis")
+                
+    except WebSocketDisconnect:
+        if user_id:
+            manager.disconnect(user_id, websocket)
+    except Exception as e:
+        print(f"[WS ERROR] Error in WebSocket connection: {e}")
+        if user_id:
+            manager.disconnect(user_id, websocket)
         try:
-            v_filter = {"$or": [{"product_id": pid_str}, {"product_id": p.get("_id")}]}
-            v_cursor = product_variants_col.find(v_filter).limit(6)
-            variants = await v_cursor.to_list(length=6)
-            seen_colors = set()
-            for v in variants:
-                color_name = v.get("color", "")
-                if color_name and color_name not in seen_colors:
-                    seen_colors.add(color_name)
-                    hex_map = {
-                        "black": "#1C1C1E", "hitam": "#1C1C1E",
-                        "white": "#F5F5F7", "putih": "#F5F5F7",
-                        "blue": "#2E3B4E", "biru": "#2E3B4E",
-                        "red": "#C41E3A", "merah": "#C41E3A",
-                        "green": "#1A6B3A", "hijau": "#1A6B3A",
-                        "gold": "#C8A951", "emas": "#C8A951",
-                        "silver": "#C0C0C0", "abu": "#8E8E93",
-                        "gray": "#8E8E93", "grey": "#8E8E93",
-                        "purple": "#6B4FA0", "ungu": "#6B4FA0",
-                        "yellow": "#F2D06B", "kuning": "#F2D06B",
-                        "pink": "#F4A7C3", "titanium": "#A8A7A3"
-                    }
-                    hex_color = hex_map.get(color_name.lower(), "#8E8E93")
-                    colors.append({"name": color_name, "hex": hex_color})
+            await websocket.close()
         except Exception:
             pass
 
-        if not colors:
-            colors = [{"name": "Default", "hex": "#8E8E93"}]
-
-        items.append({
-            "id":           pid_str,
-            "name":         p.get("name", "Unknown Product"),
-            "brand":        brand_name,
-            "price":        price_str,
-            "rating":       round(float(p.get("avg_rating", 0) or 0), 1),
-            "reviewsCount": int(p.get("total_reviews", 0) or 0),
-            "specs":        specs,
-            "tags":         tags,
-            "image":        image_url,
-            "colors":       colors
-        })
-
-    return {"items": items}
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
 
 
 class ChatMessage(BaseModel):
@@ -409,6 +316,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None  # bisa kosong jika sesi baru
     messages: List[ChatMessage]
     lang: Optional[str] = "id"
+    role: Optional[str] = None  # role admin aktif (superadmin/sales)
 
 def clean_content(s: str, max_chars: int = None) -> str:
     """Bersihkan whitespace/gandaan dan decode entity; potong jika terlalu panjang."""
@@ -454,72 +362,15 @@ def format_conversation(messages):
 
 @app.post("/v1/assistant/chat")
 async def assistant_chat(payload: ChatRequest = Body(...)):
-    return await process_chat(payload, agent_robin)
+    return await process_chat(payload, agent_vienna)
 
-@app.post("/v1/agent/chat")
-async def agent_chat(
-    payload: ChatRequest = Body(...),
-    authorization: Optional[str] = Header(None)
-):
-    # Jika header Authorization dikirimkan, verifikasi token JWT
-    if authorization:
-        try:
-            if not authorization.startswith("Bearer "):
-                raise HTTPException(status_code=401, detail="Format header otorisasi harus Bearer <token>")
-            
-            token = authorization.split(" ")[1]
-            try:
-                decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-                user_id = decoded.get("id")
-                if not user_id:
-                    raise HTTPException(status_code=401, detail="Token tidak valid: ID Pengguna tidak ditemukan.")
-                
-                # Periksa status aktif user di Redis/MongoDB untuk keamanan tambahan
-                from services.redis_service import redis_client
-                from services.mongo_service import users_col
-                from bson import ObjectId
-                try:
-                    cache_key = f"user_status:{user_id}"
-                    cached_status = await redis_client.get(cache_key)
-                    if cached_status:
-                        status_data = json.loads(cached_status)
-                        is_active = status_data.get("is_active", True)
-                        exists = status_data.get("exists", True)
-                        if not exists:
-                            raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
-                        if not is_active:
-                            raise HTTPException(status_code=403, detail="Akun Anda dinonaktifkan oleh administrator.")
-                    else:
-                        user_doc = await users_col.find_one({"_id": ObjectId(user_id)})
-                        if not user_doc:
-                            await redis_client.setex(cache_key, 300, json.dumps({"exists": False}))
-                            raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
-                        
-                        is_active = user_doc.get("is_active", True)
-                        await redis_client.setex(cache_key, 300, json.dumps({"exists": True, "is_active": is_active}))
-                        
-                        if not is_active:
-                            raise HTTPException(status_code=403, detail="Akun Anda dinonaktifkan oleh administrator.")
-                except HTTPException as he:
-                    raise he
-                except Exception:
-                    # Abaikan error format ObjectId agar tidak memblokir sesi tamu
-                    pass
-                    
-            except jwt.ExpiredSignatureError:
-                raise HTTPException(status_code=401, detail="Sesi masuk Anda telah kadaluarsa. Silakan masuk kembali.")
-            except jwt.InvalidTokenError as e:
-                raise HTTPException(status_code=401, detail=f"Otentikasi gagal: {e}")
-        except HTTPException as he:
-            raise he
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Otorisasi gagal: {str(e)}")
 
-    return await process_chat(payload, agent_lina)
 
 @app.post("/v1/gemini/chat")
 async def gemini_chat(payload: ChatRequest = Body(...)):
     return await process_chat(payload, agent_gemini)
+
+
 
 async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine):
     try:
@@ -530,12 +381,26 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
         if not messages:
             return {"error": "Tidak ada pesan dalam permintaan."}
 
+        # Check if the agent is Vienna (robin_ai_assistant)
+        is_portfolio = False
+        if hasattr(current_agent, "_agent_personality") and current_agent._agent_personality:
+            is_portfolio = current_agent._agent_personality.get("assistant_id") == "robin_ai_assistant"
+
         # ======================
         # SESSION
         # ======================
+        role = payload.role
+        if not role:
+            if user_id.startswith("admin_"):
+                role = "superadmin"
+            else:
+                role = "customer"
+
         session = await get_or_create_session(
             user_id=user_id,
-            session_id=session_id
+            session_id=session_id,
+            role=role,
+            is_portfolio=is_portfolio
         )
 
         session_id = session["session_id"]
@@ -543,7 +408,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
         # ======================
         # MEMORY
         # ======================
-        conversation = await get_messages(session_id=session_id, limit=30)
+        conversation = await get_messages(session_id=session_id, limit=30, is_portfolio=is_portfolio)
         history_messages = format_conversation(conversation) or []
 
 
@@ -554,7 +419,8 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
         retrieval = [""]
         try:
             from services.rag_service import search_documents
-            retrieval_contexts = await search_documents(messages[-1].content, limit=3)
+            collection_to_search = "portfolio_document_chunk" if is_portfolio else "document_chunk"
+            retrieval_contexts = await search_documents(messages[-1].content, limit=3, collection_name=collection_to_search)
             if retrieval_contexts:
                 retrieval = retrieval_contexts
         except Exception as e:
@@ -563,7 +429,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
         # Fetch complete registered user info if logged in (not anonymous)
         user_info = None
         user_id_str = session.get("user_id")
-        if user_id_str and not str(user_id_str).startswith("guest"):
+        if not is_portfolio and user_id_str and not str(user_id_str).startswith("guest"):
             try:
                 from services.mongo_service import users_col
                 from bson import ObjectId
@@ -586,12 +452,24 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
             except Exception as e:
                 print(f"[ERROR] Failed to fetch user info for prompt: {e}")
 
+        # Fetch device app inventory if available
+        app_inventory = None
+        if user_id:
+            try:
+                inventory_doc = await device_app_inventory_col.find_one({"user_id": user_id})
+                if inventory_doc and "apps" in inventory_doc:
+                    app_inventory = inventory_doc["apps"]
+            except Exception as e:
+                print(f"[ERROR] Failed to fetch device app inventory: {e}")
+
         prompt = build_prompt(
             session=session,
             history=history_messages,
             retrieval=retrieval,
             new_input=messages[-1].content,
-            user_info=user_info
+            user_info=user_info,
+            admin_role=payload.role,
+            app_inventory=app_inventory
         )
         
         # ======================
@@ -601,7 +479,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
             full_response = ""
 
             try:
-                async for chunk in current_agent.chat(prompt, lang=payload.lang, session_id=session_id):
+                async for chunk in current_agent.chat(prompt, lang=payload.lang, session_id=session_id, user_id=user_id, admin_role=payload.role):
 
                     text_part = ""
 
@@ -655,6 +533,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
                             session_id=session_id,
                             sender=getattr(last_msg, "role", "user"),
                             content=getattr(last_msg, "content", ""),
+                            is_portfolio=is_portfolio
                         )
 
                     # simpan response AI
@@ -663,6 +542,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
                             session_id=session_id,
                             sender="assistant",
                             content=full_response,
+                            is_portfolio=is_portfolio
                         )
 
                 except Exception as db_error:

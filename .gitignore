@@ -1,0 +1,164 @@
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================================
+# Virtual Environment & Dependencies
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+.venv
+.env
+.env.*
+!.env.example
+uv.lock
+
+# ==========================================
+# IDE / Editor
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+.history
+.idea_modules/
+
+# ==========================================
+# Operating System Files
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Project-Specific (Personal / Sensitive)
+# ==========================================
+.fastapicloud/
+.python-version
+deploy_pkg/
+memory/
+models/
+*.pth
+*.pid
+*.pid.lock
+*.log
+*.sqlite
+*.db
+*.bak
+*.tmp
+*.temp
+
+# ==========================================
+# Documents & Notes
+# ==========================================
+document/
+scratch/
+database_analysis.txt
+
+# ==========================================
+# Credentials & Secrets
+# ==========================================
+firebase-key.json
+service-account*.json
+*.key
+*.pem
+*.crt
+config.json
+secrets.json
+credentials.json
+config.yaml
+config.yml
+.env.production
+.env.staging
+
+# ==========================================
+# Test & Coverage
+# ==========================================
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache
+
+# ==========================================
+# Build & Packaging
+# ==========================================
+*.egg
+*.egg-info/
+dist/
+build/
+*.manifest
+*.spec
+
+# ==========================================
+# Misc
+# ==========================================
+*.swp
+*.swo
+*~
+.directory
+.project
+.pydevproject
+.settings/
+bin/
+tmp/
+temp/
+
+# ==========================================
+# AI/ML Specific
+# ==========================================
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.h5
+*.hdf5
+*.safetensors
+tokenizer/
+vocab/
+*.tensorboard/
+
+# ==========================================
+# Deployment
+# ==========================================
+DEPLOYMENT.md
+docker-compose.override.yml
+k8s/secrets/
+.nginx.conf
+
+
+
