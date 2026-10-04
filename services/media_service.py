@@ -291,6 +291,17 @@ def cookies_status() -> dict[str, bool]:
     return {p: cookiefile_for(p) is not None for p in ("youtube", "instagram", "threads", "facebook")}
 
 
+def cookies_env_present() -> dict[str, bool]:
+    """Boolean kehadiran env cookies per platform — untuk diagnosis deploy.
+
+    Aman diekspos: hanya True/False, TIDAK pernah nilai/panjang isi env.
+    """
+    out = {}
+    for p in ("youtube", "instagram", "threads", "facebook"):
+        out[p] = bool((os.getenv(_COOKIES_ENV[p], "") or "").strip())
+    return out
+
+
 def _ffmpeg_path() -> str | None:
     import shutil
 
@@ -626,6 +637,7 @@ def cache_status() -> dict[str, Any]:
         "max_duration_sec": MAX_DURATION_SEC,
         "max_file_bytes": MAX_FILE_BYTES,
         "cookies": cookies_status(),
+        "cookies_env": cookies_env_present(),
         "cookies_dir": str(COOKIES_DIR),
     }
     return {**c.stats(), **extra}
