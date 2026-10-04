@@ -2,7 +2,7 @@ import asyncio
 from typing import List
 from services.qdrant_service import get_qdrant_client
 from services.rag_ingestion_service import DOCUMENT_COLLECTION
-from utils.embedding import gpt_embedding
+from utils.embedding import embed_text
 
 async def search_documents(query_text: str, limit: int = 3, collection_name: str = DOCUMENT_COLLECTION) -> List[str]:
     """
@@ -14,7 +14,7 @@ async def search_documents(query_text: str, limit: int = 3, collection_name: str
 
     try:
         # Generate embedding vector for the query text
-        vector = await asyncio.to_thread(gpt_embedding, query_text)
+        vector = await asyncio.to_thread(embed_text, query_text)
         if not vector:
             print("[RAG SEARCH WARNING] Failed to generate embedding for search query.")
             return []

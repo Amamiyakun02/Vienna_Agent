@@ -23,25 +23,28 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.manifest
+*.spec
 
 # ==========================================
-# Virtual Environment & Dependencies
+# Virtual Environment & Dependency manager
 # ==========================================
 .venv/
 venv/
 ENV/
 env/
-.venv
-.env
-.env.*
-!.env.example
-uv.lock
+# NOTE: .env* diabaikan di seksi Secrets di bawah.
+# NOTE: uv.lock SENGAJA di-commit (reproducible deploy) — jangan ignore.
+.pdm-python
+.python-version.bak
 
 # ==========================================
 # IDE / Editor
 # ==========================================
 .vscode/
 .idea/
+.idea_modules/
+.history
 *.swp
 *.swo
 *~
@@ -49,98 +52,67 @@ uv.lock
 *.ntvs*
 *.njsproj
 *.sln
-.history
-.idea_modules/
 
 # ==========================================
-# Operating System Files
+# OS files
 # ==========================================
 .DS_Store
 Thumbs.db
 desktop.ini
+.directory
 
 # ==========================================
-# Project-Specific (Personal / Sensitive)
+# Env, secrets & credentials (JANGAN commit)
 # ==========================================
-.fastapicloud/
-.python-version
-deploy_pkg/
-memory/
-models/
-*.pth
-*.pid
-*.pid.lock
-*.log
-*.sqlite
-*.db
-*.bak
-*.tmp
-*.temp
-
-# ==========================================
-# Documents & Notes
-# ==========================================
-document/
-scratch/
-database_analysis.txt
-
-# ==========================================
-# Credentials & Secrets
-# ==========================================
+.env
+.env.*
+!.env.example
+.env.production
+.env.staging
 firebase-key.json
 service-account*.json
+*-key.json
 *.key
 *.pem
 *.crt
 config.json
 secrets.json
 credentials.json
+cookies.txt
+*cookies*.txt
 config.yaml
 config.yml
-.env.production
-.env.staging
 
 # ==========================================
-# Test & Coverage
+# Project runtime data (ephemeral di cloud!)
 # ==========================================
-.coverage
-htmlcov/
-.tox/
-.nox/
-.pytest_cache/
-.mypy_cache/
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache
-
-# ==========================================
-# Build & Packaging
-# ==========================================
-*.egg
-*.egg-info/
-dist/
-build/
-*.manifest
-*.spec
-
-# ==========================================
-# Misc
-# ==========================================
-*.swp
-*.swo
-*~
-.directory
-.project
-.pydevproject
-.settings/
-bin/
+# Cache downloader (yt-dlp bisa puluhan GB) + cookies login-walled.
+# Di server: arahkan via env DATA_DIR ke volume persisten bila perlu.
+data/
+*.mp4
+*.mp3
+*.wav
+*.webm
+*.mkv
+*.m4a
+*.opus
+deploy_pkg/
+memory/
+document/
+scratch/
+database_analysis.txt
+*.sqlite
+*.db
+*.bak
+*.tmp
+*.temp
 tmp/
 temp/
+*.log
+*.pid
+*.pid.lock
 
-# ==========================================
-# AI/ML Specific
-# ==========================================
+# Model binaries (kode models/*.py tetap di-commit)
 *.onnx
 *.pt
 *.pth
@@ -148,17 +120,30 @@ temp/
 *.h5
 *.hdf5
 *.safetensors
+*.bin
+*.gguf
 tokenizer/
 vocab/
-*.tensorboard/
 
 # ==========================================
-# Deployment
+# Test & coverage
 # ==========================================
-DEPLOYMENT.md
+.coverage
+coverage.xml
+*.cover
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# ==========================================
+# FastAPI Cloud / deploy lokal
+# ==========================================
+.fastapicloud/
 docker-compose.override.yml
 k8s/secrets/
 .nginx.conf
-
-
-
+DEPLOYMENT.md

@@ -1,6 +1,7 @@
 import os
 import hashlib
 import base64
+import hmac
 import urllib.request
 import json
 from datetime import datetime, timezone, timedelta
@@ -70,7 +71,7 @@ def verify_password(password: str, hashed: str) -> bool:
             salt,
             iterations
         )
-        return actual_key == expected_key
+        return hmac.compare_digest(actual_key, expected_key)
     except Exception:
         return False
 

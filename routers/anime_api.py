@@ -1,9 +1,12 @@
 import os
 import re
+import time
+import threading
 import requests
 import urllib.parse
-from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Optional
+from requests.adapters import HTTPAdapter
+from bs4 import BeautifulSoup, NavigableString
+from typing import List, Dict, Any, Optional, Tuple
 from fastapi import APIRouter, Query, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -13,6 +16,74 @@ router = APIRouter(prefix="/v1", tags=["Anime Downloader"])
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+
+KUSONIME_BASE = "https://kusonime.com"
+KUSONIME_LIST_URL = f"{KUSONIME_BASE}/list-anime-batch-sub-indo/"
+
+# --- Transport hemat: 1 session keep-alive (reuse TLS) untuk semua scrape ---
+_SESSION = requests.Session()
+_SESSION.headers.update(headers)
+_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+_SESSION.mount("https://", _adapter)
+_SESSION.mount("http://", _adapter)
+
+# --- Cache memori TTL: situs anime jarang berubah, request UI sering berulang ---
+_CACHE: Dict[str, Tuple[float, requests.Response]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_lookup(url: str, ttl: int) -> Optional[requests.Response]:
+    with _CACHE_LOCK:
+        hit = _CACHE.get(url)
+        if hit and (time.time() - hit[0]) < ttl:
+            return hit[1]
+        if hit:
+            del _CACHE[url]
+    return None
+
+
+def _cache_store(url: str, resp: requests.Response) -> requests.Response:
+    # Simpan salinan ringan (bukan response live) agar aman dipakai ulang.
+    cached = requests.Response()
+    cached.status_code = resp.status_code
+    cached.url = resp.url
+    cached.encoding = resp.encoding or "utf-8"
+    cached._content = resp.content
+    cached.headers["Content-Type"] = resp.headers.get("Content-Type", "text/html")
+    with _CACHE_LOCK:
+        if len(_CACHE) > 200:  # batasi memori
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[url] = (time.time(), cached)
+    return cached
+
+
+def _fetch(url: str, timeout: Tuple[int, int] = (5, 15), retries: int = 4,
+           ttl: int = 0, **kwargs) -> Optional[requests.Response]:
+    """GET hemat dengan retry cepat + cache opsional.
+
+    - timeout=(connect, read): gagal-cepat bila jaringan stall,
+      karena stall 20 detik adalah penyebab utama lambat.
+    - backoff pendek 0.4/0.8/1.2 dtk (dulu 1.5/3/4.5 dtk).
+    - ttl>0: kembalikan cache bila masih segar (halaman anime jarang berubah).
+    """
+    if ttl > 0:
+        hit = _cache_lookup(url, ttl)
+        if hit is not None:
+            return hit
+    backoffs = (0.4, 0.8, 1.2)
+    for attempt in range(retries):
+        try:
+            resp = _SESSION.get(url, timeout=timeout,
+                                allow_redirects=True, **kwargs)
+            resp.raise_for_status()
+            if len(resp.text) < 2000 and ("challenge" in resp.text.lower()
+                                          or "just a moment" in resp.text.lower()):
+                raise ValueError("anti-bot challenge page")
+            return _cache_store(url, resp) if ttl > 0 else resp
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+    return None
 
 class ResolvedFile(BaseModel):
     resolved_url: str
@@ -55,6 +126,10 @@ class PixeldrainListInfo(BaseModel):
     file_count: int
     files: List[PixeldrainFileDetail]
 
+class DownloadGroup(BaseModel):
+    title: str
+    links: Dict[str, List[MirrorLink]]
+
 class AnimeDownloadResponse(BaseModel):
     status: str
     search_query: str
@@ -66,6 +141,7 @@ class AnimeDownloadResponse(BaseModel):
     pixeldrain_file_info: Optional[PixeldrainFileInfo] = None
     pixeldrain_list_info: Optional[PixeldrainListInfo] = None
     available_links: Dict[str, List[MirrorLink]]
+    groups: List[DownloadGroup] = []
 
 def format_size(size_bytes: int) -> str:
     if size_bytes < 1024:
@@ -75,58 +151,163 @@ def format_size(size_bytes: int) -> str:
     else:
         return f"{size_bytes / 1048576:.2f} MB"
 
+def _rank_results(query: str, results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Urutkan hasil: exact match > awalan > mengandung, lalu abjad."""
+    q = query.strip().lower()
+
+    def score(r: Dict[str, str]) -> tuple:
+        t = r["title"].strip().lower()
+        core = re.sub(r"\s*(bd\s*)?batch\s*subtitle\s*indonesia\s*$", "", t).strip()
+        if core == q or t == q:
+            return (0, t)
+        if core.startswith(q) or t.startswith(q):
+            return (1, t)
+        if q in core or q in t:
+            return (2, t)
+        return (3, t)
+
+    return sorted(results, key=score)
+
+
 def search_anime(query: str) -> List[Dict[str, str]]:
-    url = f"https://kusonime.com/?s={requests.utils.quote(query)}"
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        results = []
-        for h2 in soup.find_all('h2'):
-            a = h2.find('a')
-            if a:
-                title = a.get_text().strip()
-                href = a.get('href', '').strip()
-                if href.startswith("https://kusonime.com/") and not any(x in href for x in ['/category/', '/genres/', '/list-anime-']):
-                    results.append({
-                        "title": title,
-                        "url": href
-                    })
-        return results
-    except Exception:
+    url = f"{KUSONIME_BASE}/?s={urllib.parse.quote(query)}"
+    response = _fetch(url, ttl=1800)
+    if response is None:
         return []
+    soup = BeautifulSoup(response.text, 'html.parser')
+    results = []
+    for h2 in soup.find_all('h2'):
+        a = h2.find('a')
+        if a:
+            title = a.get_text().strip()
+            href = a.get('href', '').strip()
+            if href.startswith(KUSONIME_BASE + "/") and not any(x in href for x in ['/category/', '/genres/', '/list-anime-', '/seasons/', '/seasons-list']):
+                results.append({
+                    "title": title,
+                    "url": href
+                })
+    # hilangkan duplikat URL, lalu ranking (exact match dulu)
+    seen, uniq = set(), []
+    for r in results:
+        if r["url"] not in seen:
+            seen.add(r["url"])
+            uniq.append(r)
+    return _rank_results(query, uniq)
+
+
+def scrape_list_page(page: int = 1) -> Dict[str, Any]:
+    """Scrape halaman list batch: .daftarkartun > .penzbar > .jdlbar > a.
+
+    Returns: {"entries": [{"title","url"}], "page": int, "total_pages": int}
+    """
+    url = KUSONIME_LIST_URL if page <= 1 else f"{KUSONIME_LIST_URL}page/{page}/"
+    response = _fetch(url, ttl=3600)
+    if response is None:
+        return {"entries": [], "page": page, "total_pages": 0}
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    container = soup.select_one('.daftarkartun') or soup
+
+    entries: List[Dict[str, str]] = []
+    for jdl in container.select('.penzbar .jdlbar'):
+        a = jdl.find('a')
+        if a and a.get('href'):
+            title = a.get_text().strip()
+            href = a.get('href', '').strip()
+            if title and href.startswith(KUSONIME_BASE + "/"):
+                entries.append({"title": title, "url": href})
+
+    # fallback bila struktur berubah
+    if not entries:
+        seen = set()
+        for a in container.find_all('a', href=True):
+            href = a['href'].strip()
+            title = a.get_text().strip()
+            if (href.startswith(KUSONIME_BASE + "/") and len(href) > 30
+                    and len(title) > 10 and href not in seen
+                    and not any(x in href for x in ["/genres/", "/seasons/",
+                               "/page/", "/list-anime-batch"])):
+                seen.add(href)
+                entries.append({"title": title, "url": href})
+
+    total_pages = 0
+    nav = soup.select_one('.wp-pagenavi')
+    if nav:
+        # Teks nav menempel dengan nomor link, jadi hanya baca text-node langsung.
+        direct_text = "".join(
+            str(c) for c in nav.children if isinstance(c, NavigableString))
+        m = re.search(r'of\s+(\d+)', direct_text)
+        if m:
+            total_pages = int(m.group(1))
+        else:
+            nums = [int(x) for a in nav.find_all('a', href=True)
+                    for x in re.findall(r'/page/(\d+)/', a['href'])]
+            if nums:
+                total_pages = max(nums)
+
+    return {"entries": entries, "page": page, "total_pages": total_pages}
+
+def _parse_smokeurl_row(block) -> tuple:
+    """Parse satu baris .smokeurlrh -> (RES, [server_links])."""
+    strong = block.find('strong')
+    res = strong.get_text().strip().upper() if strong else "UNKNOWN"
+    server_links = []
+    for a in block.find_all('a'):
+        server_name = a.get_text().strip()
+        url = a.get('href', '').strip()
+        if url and server_name:
+            server_links.append({"server": server_name, "url": url})
+    return res, server_links
+
+
+def scrape_download_groups(anime_url: str) -> List[Dict[str, Any]]:
+    """Scrape per-GRUP part: tiap div.smokeddlrh = 1 kelompok
+    (judul di .smokettlrh, baris resolusi di .smokeurlrh).
+
+    Returns: [{"title": str, "downloads": {RES: [server_links]}}]
+    """
+    response = _fetch(anime_url, ttl=1800)
+    if response is None:
+        return []
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    groups: List[Dict[str, Any]] = []
+    containers = soup.select('div.smokeddlrh')
+    if containers:
+        for grp in containers:
+            title_tag = grp.select_one('.smokettlrh')
+            title = title_tag.get_text().strip() if title_tag else ""
+            rows = grp.select('div.smokeurlrh') or \
+                grp.find_all('div', class_=re.compile(r'smokeurl'))
+            downloads_by_res: Dict[str, List[Dict[str, str]]] = {}
+            for block in rows:
+                res, server_links = _parse_smokeurl_row(block)
+                if server_links:
+                    downloads_by_res.setdefault(res, []).extend(server_links)
+            if downloads_by_res:
+                groups.append({"title": title, "downloads": downloads_by_res})
+
+    if not groups:
+        flat = scrape_download_links(anime_url)
+        if flat:
+            groups.append({"title": "", "downloads": flat})
+    return groups
+
 
 def scrape_download_links(anime_url: str) -> Dict[str, List[Dict[str, str]]]:
-    try:
-        response = requests.get(anime_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        download_blocks = soup.find_all('div', class_=re.compile(r'smokeurl'))
-        downloads_by_res = {}
-        for block in download_blocks:
-            strong = block.find('strong')
-            res = strong.get_text().strip().upper() if strong else "UNKNOWN"
-            links = block.find_all('a')
-            server_links = []
-            for a in links:
-                server_name = a.get_text().strip()
-                url = a.get('href', '').strip()
-                if url:
-                    server_links.append({
-                        "server": server_name,
-                        "url": url
-                    })
-            if server_links:
-                downloads_by_res[res] = server_links
-        return downloads_by_res
-    except Exception:
-        return {}
+    # Versi FLAT (gabungan semua part, untuk kompatibilitas):
+    # flatten dari scrape_download_groups agar cukup 1x fetch.
+    flat: Dict[str, List[Dict[str, str]]] = {}
+    for g in scrape_download_groups(anime_url):
+        for res, links in g.get("downloads", {}).items():
+            flat.setdefault(res, []).extend(links)
+    return flat
 
 def get_pixmap_file_info(file_id: str) -> Optional[Dict[str, Any]]:
     info_url = f"https://pixeldrain.com/api/file/{file_id}/info"
     try:
-        res = requests.get(info_url, headers=headers, timeout=10)
-        if res.status_code == 200:
+        res = _fetch(info_url, timeout=(5, 10), ttl=3600)
+        if res is not None and res.status_code == 200:
             return res.json()
     except Exception:
         pass
@@ -135,20 +316,43 @@ def get_pixmap_file_info(file_id: str) -> Optional[Dict[str, Any]]:
 def get_pixmap_list_info(list_id: str) -> Optional[Dict[str, Any]]:
     list_url = f"https://pixeldrain.com/api/list/{list_id}"
     try:
-        res = requests.get(list_url, headers=headers, timeout=10)
-        if res.status_code == 200:
+        res = _fetch(list_url, timeout=(5, 10), ttl=3600)
+        if res is not None and res.status_code == 200:
             return res.json()
     except Exception:
         pass
     return None
 
+_GDRIVE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
 def resolve_gdrive_direct_link(file_id: str) -> Dict[str, Any]:
-    session = requests.Session()
+    """Resolve GDrive dengan cache hasil 1 jam (confirm-page jarang berubah)."""
+    with _CACHE_LOCK:
+        hit = _GDRIVE_CACHE.get(file_id)
+        if hit and (time.time() - hit[0]) < 3600:
+            return hit[1]
+    result = _resolve_gdrive_live(file_id)
+    with _CACHE_LOCK:
+        _GDRIVE_CACHE[file_id] = (time.time(), result)
+    return result
+
+
+def _resolve_gdrive_live(file_id: str) -> Dict[str, Any]:
     gdrive_base_url = 'https://docs.google.com/uc?export=download'
+    for attempt in range(3):
+        try:
+            response = _SESSION.get(gdrive_base_url, params={'id': file_id},
+                                    timeout=(5, 15))
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    else:
+        return _gdrive_fallback(file_id)
     try:
-        response = session.get(gdrive_base_url, params={'id': file_id}, headers=headers, timeout=15)
         token = None
-        for key, value in response.cookies.items():
+        for key, value in response.cookies.get_dict().items():
             if key.startswith('download_warning'):
                 token = value
                 break
@@ -209,7 +413,10 @@ def resolve_gdrive_direct_link(file_id: str) -> Dict[str, Any]:
                 filename = match.group(1)
             else:
                 filename = cd.split('filename=')[1].split(';')[0].strip()
-        size_bytes = int(response.headers.get('content-length', 0))
+        try:
+            size_bytes = int(response.headers.get('content-length', 0) or 0)
+        except (ValueError, TypeError):
+            size_bytes = 0
         response.close()
         
         direct_url = f"https://docs.google.com/uc?export=download&id={file_id}"
@@ -226,17 +433,21 @@ def resolve_gdrive_direct_link(file_id: str) -> Dict[str, Any]:
             }]
         }
     except Exception:
-        direct_url = f"https://docs.google.com/uc?export=download&id={file_id}"
-        return {
-            "server": "Google Drive",
-            "requires_interaction": False,
-            "files": [{
-                "resolved_url": direct_url,
-                "filename": f"gdrive_file_{file_id}.rar",
-                "size": 0,
-                "size_formatted": "Unknown"
-            }]
-        }
+        return _gdrive_fallback(file_id)
+
+
+def _gdrive_fallback(file_id: str) -> Dict[str, Any]:
+    direct_url = f"https://docs.google.com/uc?export=download&id={file_id}"
+    return {
+        "server": "Google Drive",
+        "requires_interaction": False,
+        "files": [{
+            "resolved_url": direct_url,
+            "filename": f"gdrive_file_{file_id}.rar",
+            "size": 0,
+            "size_formatted": "Unknown"
+        }]
+    }
 
 def resolve_pixeldrain_direct_link(url: str) -> Dict[str, Any]:
     file_match = re.search(r'/u/([a-zA-Z0-9_-]+)', url)
@@ -335,8 +546,9 @@ def search_samehadaku_ongoing(query: Optional[str] = None) -> List[Dict[str, str
     title_query = urllib.parse.quote(query) if query else ""
     url = f"https://v2.samehadaku.how/daftar-anime-2/?title={title_query}&status=Currently+Airing&type=&order=title"
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        response = _fetch(url, ttl=600)
+        if response is None:
+            return []
         soup = BeautifulSoup(response.text, 'html.parser')
         results = []
         
@@ -384,13 +596,17 @@ def normalize_samehadaku_url(url: str) -> str:
 def scrape_samehadaku_episodes(anime_url: str) -> List[Dict[str, str]]:
     anime_url = normalize_samehadaku_url(anime_url)
     try:
-        response = requests.get(anime_url, headers=headers, timeout=15)
+        response = _fetch(anime_url, ttl=600)
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Situs Samehadaku tidak dapat dijangkau saat ini, coba lagi sesaat."
+            )
         if response.status_code == 404 or "v2.samehadaku.how" not in response.url.lower():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"URL '{anime_url}' tidak ditemukan atau dialihkan (404). Harap pastikan menggunakan URL anime persis dari output 'daftar_anime_ongoing' tanpa mengubah slug."
             )
-        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         results = []
         
@@ -419,13 +635,17 @@ def scrape_samehadaku_episodes(anime_url: str) -> List[Dict[str, str]]:
 def scrape_samehadaku_download_links(episode_url: str) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
     episode_url = normalize_samehadaku_url(episode_url)
     try:
-        response = requests.get(episode_url, headers=headers, timeout=15)
+        response = _fetch(episode_url, ttl=600)
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Situs Samehadaku tidak dapat dijangkau saat ini, coba lagi sesaat."
+            )
         if response.status_code == 404 or "v2.samehadaku.how" not in response.url.lower():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"URL episode '{episode_url}' tidak ditemukan atau dialihkan (404). Harap pastikan menggunakan URL episode persis yang didapatkan dari output 'lihat_episode_ongoing' tanpa mengubah slug."
             )
-        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
         download_blocks = soup.select('.download-eps')
@@ -500,8 +720,8 @@ def ongoing_anime_download_links(episode_url: str = Query(..., description='URL 
     episode_url = normalize_samehadaku_url(episode_url)
     episode_title = "Unknown Episode"
     try:
-        response = requests.get(episode_url, headers=headers, timeout=10)
-        if response.status_code == 200:
+        response = _fetch(episode_url, ttl=600, retries=2)
+        if response is not None and response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             h1 = soup.find('h1')
             if h1:
@@ -538,8 +758,8 @@ def ongoing_anime_download(
     episode_url = normalize_samehadaku_url(episode_url)
     episode_title = "Unknown Episode"
     try:
-        response = requests.get(episode_url, headers=headers, timeout=10)
-        if response.status_code == 200:
+        response = _fetch(episode_url, ttl=600, retries=2)
+        if response is not None and response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             h1 = soup.find('h1')
             if h1:
@@ -686,24 +906,68 @@ def ongoing_anime_download(
 def anime_downloader(
     search: str = Query(..., description='Judul anime yang ingin dicari'),
     resolution: Optional[str] = Query(None, description='Resolusi pilihan (misal: 480p, 720p, 1080p)'),
-    server: Optional[str] = Query(None, description='Server cermin download pilihan (misal: pixeldrain, google drive, mega)')
+    server: Optional[str] = Query(None, description='Server cermin download pilihan (misal: pixeldrain, google drive, mega)'),
+    anime_url: Optional[str] = Query(None, description='URL detail Kusonime langsung (misal dari other_matches/batch_list) — bila diisi, pencarian dilewati agar part yang dipilih tepat, mis. Part 2')
 ):
-    results = search_anime(search)
-    if not results:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Anime dengan kata kunci '{search}' tidak ditemukan."
-        )
-        
-    matched_anime = SearchResult(title=results[0]['title'], url=results[0]['url'])
-    other_matches = [SearchResult(title=r['title'], url=r['url']) for r in results[1:]]
+    matched_anime: SearchResult
+    other_matches: List[SearchResult] = []
+    search_query = search
+    if anime_url:
+        # Validasi: hanya izinkan URL detail post Kusonime (cegah SSRF ke host lain)
+        try:
+            host = (urllib.parse.urlparse(anime_url).hostname or "").lower()
+        except Exception:
+            host = ""
+        if host != "kusonime.com":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="anime_url harus URL detail post kusonime.com."
+            )
+        response = _fetch(anime_url, ttl=1800)
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Halaman anime tidak dapat dijangkau saat ini, coba lagi sesaat."
+            )
+        soup = BeautifulSoup(response.text, 'html.parser')
+        h1 = soup.select_one('h1.jdlz') or soup.find('h1')
+        title = h1.get_text().strip() if h1 else anime_url
+        matched_anime = SearchResult(title=title, url=anime_url)
+        search_query = f"{search} (URL langsung)"
+    else:
+        results = search_anime(search)
+        if not results:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Anime dengan kata kunci '{search}' tidak ditemukan."
+            )
+        matched_anime = SearchResult(title=results[0]['title'], url=results[0]['url'])
+        other_matches = [SearchResult(title=r['title'], url=r['url']) for r in results[1:]]
     
-    downloads = scrape_download_links(matched_anime.url)
+    # Grup per-part (Part 1, Part 2, ...) untuk tampilan terpisah — 1x fetch.
+    # Versi flat (gabungan) dipakai untuk seleksi resolusi/server default.
+    _groups_raw = scrape_download_groups(matched_anime.url)
+    downloads: Dict[str, List[Dict[str, str]]] = {}
+    for g in _groups_raw:
+        for res, links in g.get("downloads", {}).items():
+            downloads.setdefault(res, []).extend(links)
     if not downloads:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Tidak ada link download batch ditemukan untuk anime ini.'
         )
+    if not _groups_raw:
+        _groups_raw = [{"title": "", "downloads": downloads}]
+    groups_formatted = [
+        DownloadGroup(
+            title=g.get("title", ""),
+            links={
+                res_key: [MirrorLink(server=m['server'], url=m['url']) for m in m_list]
+                for res_key, m_list in g.get("downloads", {}).items()
+            },
+        )
+        for g in _groups_raw
+    ]
         
     selected_res = None
     if resolution:
@@ -817,7 +1081,7 @@ def anime_downloader(
         
     return AnimeDownloadResponse(
         status="success",
-        search_query=search,
+        search_query=search_query,
         matched_anime=matched_anime,
         other_matches=other_matches,
         selected_resolution=selected_res,
@@ -825,7 +1089,105 @@ def anime_downloader(
         download_url=mirror_url,
         pixeldrain_file_info=pixeldrain_file_info,
         pixeldrain_list_info=pixeldrain_list_info,
-        available_links=available_links_formatted
+        available_links=available_links_formatted,
+        groups=groups_formatted
+    )
+
+# Mirror tanpa API direct-link publik (hanya bisa dibuka manual di browser).
+MANUAL_MIRRORS = {
+    "acefile.co": "Google Sharer / Acefile",
+    "mega.nz": "Mega.nz",
+    "uptobox.com": "UptoBox",
+    "hxfile.co": "Hxfile",
+    "lbx.to": "Linkbox",
+    "teraboxapp.com": "Terabox",
+    "terabox.com": "Terabox",
+    "krakenfiles.com": "Krakenfiles",
+    "1fichier.com": "1Fichier",
+    "mediafire.com": "MediaFire",
+    "gofile.io": "Gofile",
+}
+
+
+def manual_mirror_label(url: str) -> Optional[str]:
+    lowered = url.lower()
+    for domain, label in MANUAL_MIRRORS.items():
+        if domain in lowered:
+            return label
+    return None
+
+
+class BatchListEntry(BaseModel):
+    title: str
+    url: str
+
+
+class BatchListResponse(BaseModel):
+    status: str
+    page: int
+    total_pages: int
+    count: int
+    entries: List[BatchListEntry]
+
+
+@router.get('/anime/batch_list', response_model=BatchListResponse)
+def anime_batch_list(
+    page: int = Query(1, ge=1, description='Nomor halaman (diabaikan bila huruf diisi)'),
+    huruf: Optional[str] = Query(None, description='Filter huruf awal judul (A-Z, 0-9) — memindai SEMUA halaman'),
+):
+    """Jelajahi daftar anime batch Kusonime.
+
+    Tanpa huruf: kembalikan 1 halaman (4 halaman total).
+    Dengan huruf: agregat entri berawalan huruf tersebut dari semua halaman.
+    """
+    if huruf:
+        initial = huruf.strip().upper()[:1]
+        first = scrape_list_page(1)
+        total = first.get("total_pages", 0) or 1
+        total = min(total, 10)  # pengaman bila situs berubah
+        pages_data = [first]
+        if total > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(total - 1, 4)) as pool:
+                pages_data.extend(pool.map(scrape_list_page, range(2, total + 1)))
+        entries: List[Dict[str, str]] = []
+        for pdata in pages_data:
+            entries.extend(
+                e for e in pdata.get("entries", [])
+                if e["title"].lstrip("\u201c\"'(").upper().startswith(initial)
+            )
+        if not entries:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Tidak ada judul berawalan '{initial}' di daftar batch."
+            )
+        return BatchListResponse(
+            status="success",
+            page=1,
+            total_pages=1,
+            count=len(entries),
+            entries=[BatchListEntry(title=e["title"], url=e["url"]) for e in entries]
+        )
+
+    data = scrape_list_page(page)
+    entries = data["entries"]
+    total_pages = data["total_pages"]
+    if total_pages and page > total_pages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Halaman {page} melebihi total {total_pages} halaman."
+        )
+    if not entries:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Daftar batch tidak ditemukan (situs tidak dapat dijangkau)."
+        )
+    return BatchListResponse(
+        status="success",
+        page=page,
+        total_pages=total_pages,
+        count=len(entries),
+        entries=[BatchListEntry(title=e["title"], url=e["url"]) for e in entries]
     )
 
 @router.get('/anime_downloader/resolve', response_model=ResolveResponse)
@@ -877,17 +1239,24 @@ def resolve_anime_url(url: str = Query(..., description='Tautan cermin asal yang
             files=files_clean
         )
     else:
+        label = manual_mirror_label(url) or "External Mirror"
         return ResolveResponse(
             status="success",
             original_url=url,
-            server="External Mirror",
+            server=label,
             requires_interaction=True,
             files=[]
         )
 
 @router.get('/anime_downloader/proxy')
 def proxy_download(url: str = Query(..., description='Direct URL to proxy (e.g. Pixeldrain api)')):
-    if 'pixeldrain.com' not in url.lower():
+    # Strict hostname check (substring matching is bypassable via
+    # crafted query strings like https://evil.com/?x=pixeldrain.com).
+    try:
+        hostname = (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        hostname = ""
+    if hostname != "pixeldrain.com" and not hostname.endswith(".pixeldrain.com"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Hanya mendukung proxying dari server Pixeldrain."

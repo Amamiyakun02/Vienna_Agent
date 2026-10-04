@@ -1,10 +1,60 @@
 import os
+import time
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 from openai import AsyncOpenAI
 import json
 import asyncio
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+try:
+    # mcp >= 2.x (snake_case, yields 2 streams)
+    from mcp.client.streamable_http import streamable_http_client as _mcp_http_client
+except ImportError:  # pragma: no cover - mcp 1.x fallback
+    from mcp.client.streamable_http import streamablehttp_client as _mcp_http_client
+
+streamablehttp_client = _mcp_http_client
+
+from contextlib import asynccontextmanager
+
+
+# Assistant IDs yang termasuk jalur portfolio (web Vienna).
+# vienna.json memakai "vienna_ai_assistant"; "robin_ai_assistant" dipertahankan
+# untuk kompatibilitas historis.
+PORTFOLIO_ASSISTANT_IDS = {"robin_ai_assistant", "vienna_ai_assistant"}
+
+
+def is_portfolio_persona(personality: dict | None) -> bool:
+    """True jika persona termasuk asisten portfolio (bukan shop/Lina)."""
+    if not personality:
+        return False
+    return personality.get("assistant_id") in PORTFOLIO_ASSISTANT_IDS
+
+
+# Model chat Gemini khusus free tier (lihat AI Studio rate limit):
+# primer 3.1-flash-lite (500 RPD) + fallback 3.5-flash-lite (500 RPD).
+# Full Flash hanya 20 RPD, Pro 0 — jangan dipakai sebagai otak utama.
+CHAT_PRIMARY_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash-lite")
+CHAT_FALLBACK_MODEL = os.getenv("GEMINI_CHAT_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+
+
+def _is_gemini_retryable(err: Exception) -> bool:
+    """True bila error kemungkinan limit/overload sementara (layak fallback)."""
+    s = f"{type(err).__name__}: {err}".lower()
+    return any(k in s for k in (
+        "429", "resource_exhausted", "quota", "rate limit", "rate-limit",
+        "503", "overloaded", "unavailable", "500", "internal error",
+        "deadline exceeded", "timeout",
+    ))
+
+
+@asynccontextmanager
+async def _mcp_session():
+    """Open an initialized MCP ClientSession, compatible with mcp 1.x and 2.x
+    streamable HTTP clients (which yield 3 vs 2 values respectively)."""
+    async with _mcp_http_client(MCP_URL) as streams:
+        read, write = streams[0], streams[1]
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
 from google import genai
 from google.genai import types
 from datetime import datetime
@@ -346,106 +396,123 @@ async def get_mcp_tools():
             
         print("[MCP CACHE] Fetching tools from MCP server for the first time...")
         try:
-            async with streamablehttp_client(MCP_URL) as (read, write, _):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    mcp_tools_resp = await session.list_tools()
-                    tools = []
-                    for t in mcp_tools_resp.tools:
-                        tools.append({
-                            "type": "function",
-                            "function": {
-                               "name": t.name,
-                               "description": t.description,
-                               "parameters": t.inputSchema
-                            }
-                        })
-                    _mcp_tools_cache = tools + DEVICE_TOOLS
-                    print(f"[MCP CACHE] Successfully cached {len(_mcp_tools_cache)} tools (including device tools)!")
-                    return _mcp_tools_cache
+            async with _mcp_session() as session:
+                mcp_tools_resp = await session.list_tools()
+                tools = []
+                for t in mcp_tools_resp.tools:
+                    # mcp 1.x: inputSchema (camelCase) — mcp 2.x: input_schema
+                    schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None) or {}
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                           "name": t.name,
+                           "description": t.description,
+                           "parameters": schema
+                        }
+                    })
+                _mcp_tools_cache = tools + DEVICE_TOOLS
+                print(f"[MCP CACHE] Successfully cached {len(_mcp_tools_cache)} tools (including device tools)!")
+                return _mcp_tools_cache
         except Exception as e:
             print(f"[MCP CACHE ERROR] Failed to fetch tools from MCP server: {e}")
             return DEVICE_TOOLS
 
 
 _embedding_provider = None  # "openai" atau "gemini"
+_embedding_cooldown_until = 0.0  # monotonic — jeda bila semua provider limit
 _tool_embeddings_cache = {}  # Map: tool_name -> list[float]
 _tool_embeddings_lock = asyncio.Lock()
 
+try:
+    EMBEDDING_COOLDOWN_S = float(os.getenv("EMBEDDING_COOLDOWN_S", "60"))
+except ValueError:
+    EMBEDDING_COOLDOWN_S = 60.0
+
+
+def _redact_url(text: str) -> str:
+    """Sembunyikan ?key=... agar API key tidak bocor ke log."""
+    import re
+    return re.sub(r"([?&]key=)[^&\s]+", r"\1***", str(text))
+
+
+async def _fetch_openai_embedding(text: str, api_key: str) -> list[float]:
+    import httpx
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "input": text,
+                "model": "text-embedding-3-small"
+            },
+            timeout=5.0
+        )
+        res.raise_for_status()
+        return res.json()["data"][0]["embedding"]
+
+
+async def _fetch_gemini_embedding(text: str, api_key: str) -> list[float]:
+    import httpx
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            url,
+            json={
+                "model": "models/gemini-embedding-001",
+                "content": {
+                    "parts": [{"text": text}]
+                }
+            },
+            timeout=5.0
+        )
+        res.raise_for_status()
+        return res.json()["embedding"]["values"]
+
+
 async def _get_text_embedding(text: str) -> list[float]:
-    global _embedding_provider
+    """Embedding dengan prioritas Gemini (OpenAI credits habis) + cooldown anti-429.
+
+    Urutan coba: sticky provider -> EMBEDDING_PROVIDER (default "gemini") ->
+    sisanya. Bila semua gagal, berhenti memanggil API selama
+    EMBEDDING_COOLDOWN_S detik — filter semantik otomatis bypass (semua tools)
+    sampai cooldown selesai. Tidak pernah raise.
+    """
+    global _embedding_provider, _embedding_cooldown_until
+    if time.monotonic() < _embedding_cooldown_until:
+        return []  # masih cooldown — hemat kuota, filter bypass
+
     openai_key = os.getenv("OPENAI_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
-    
-    if _embedding_provider is None:
-        if openai_key:
-            _embedding_provider = "openai"
-        elif gemini_key:
-            _embedding_provider = "gemini"
-            
-    if _embedding_provider == "openai" and openai_key:
+    preferred = os.getenv("EMBEDDING_PROVIDER", "gemini").lower()
+    if preferred not in ("gemini", "openai"):
+        preferred = "gemini"
+
+    order: list[str] = []
+    for p in ([_embedding_provider] if _embedding_provider else []) + [preferred, "gemini", "openai"]:
+        if p and p not in order and ((p == "gemini" and gemini_key) or (p == "openai" and openai_key)):
+            order.append(p)
+
+    last_err: Exception | None = None
+    for provider in order:
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    "https://api.openai.com/v1/embeddings",
-                    headers={
-                        "Authorization": f"Bearer {openai_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "input": text,
-                        "model": "text-embedding-3-small"
-                    },
-                    timeout=5.0
-                )
-                res.raise_for_status()
-                return res.json()["data"][0]["embedding"]
+            if provider == "gemini":
+                emb = await _fetch_gemini_embedding(text, gemini_key or "")
+            else:
+                emb = await _fetch_openai_embedding(text, openai_key or "")
+            if emb:
+                if _embedding_provider not in (None, provider):
+                    _tool_embeddings_cache.clear()  # dimensi beda provider — re-embed
+                _embedding_provider = provider
+                return emb
         except Exception as e:
-            print(f"[SEMANTIC FILTER WARN] Gagal mendapatkan OpenAI embedding: {e}")
-            if gemini_key:
-                _embedding_provider = "gemini"
-                _tool_embeddings_cache.clear()  # Bersihkan cache agar re-embed dengan Gemini
-                # Lanjutkan dengan mencoba mengambil embedding menggunakan Gemini
-                try:
-                    import httpx
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={gemini_key}"
-                    async with httpx.AsyncClient() as client:
-                        res = await client.post(
-                            url,
-                            json={
-                                "model": "models/gemini-embedding-001",
-                                "content": {
-                                    "parts": [{"text": text}]
-                                }
-                            },
-                            timeout=5.0
-                        )
-                        res.raise_for_status()
-                        return res.json()["embedding"]["values"]
-                except Exception as ge:
-                    print(f"[SEMANTIC FILTER WARN] Gagal mendapatkan Gemini embedding setelah fallback: {ge}")
-            
-    if (_embedding_provider == "gemini" or gemini_key) and gemini_key:
-        try:
-            import httpx
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={gemini_key}"
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    url,
-                    json={
-                        "model": "models/gemini-embedding-001",
-                        "content": {
-                            "parts": [{"text": text}]
-                        }
-                    },
-                    timeout=5.0
-                )
-                res.raise_for_status()
-                return res.json()["embedding"]["values"]
-        except Exception as e:
-            print(f"[SEMANTIC FILTER WARN] Gagal mendapatkan Gemini embedding: {e}")
-            
+            last_err = e
+            print(f"[SEMANTIC FILTER WARN] Embedding {provider} gagal: {_redact_url(e)}")
+    if last_err is not None:
+        _embedding_cooldown_until = time.monotonic() + EMBEDDING_COOLDOWN_S
+        print(f"[SEMANTIC FILTER] Semua provider gagal — jeda {EMBEDDING_COOLDOWN_S:.0f}s (filter bypass sementara).")
     return []
 
 async def _prepare_tool_embeddings(all_tools: list):
@@ -490,30 +557,40 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
 
 async def _filter_relevant_tools(prompt: str, all_tools: list, always_include_device_tools: bool = False) -> list:
     """Filter tools based on semantic similarity of prompt and tool description."""
+    # Tools wajib (system / general tools) — didefinisikan duluan agar fast-path
+    # cooldown bisa memakainya tanpa embedding sama sekali.
+    always_include_names = {
+        "get_current_time", "calculate", "update_session_context",
+        "waktu_sekarang", "info_sistem"
+    }
+
+    if always_include_device_tools:
+        always_include_names.update([
+            "open_app", "list_files", "read_file", "get_latest_photo",
+            "click_text", "input_text", "list_installed_apps", "read_screen"
+        ])
+
+    # 0. Fast-path: embedding limit/cooldown — skip SEMUA HTTP (~1s hemat),
+    # langsung pakai tools wajib (±13). Chat tetap jalan, akurasi tool pulih
+    # otomatis saat kuota kembali.
+    if time.monotonic() < _embedding_cooldown_until:
+        fast = [t for t in all_tools
+                if (t["function"]["name"] if "function" in t else t.get("name")) in always_include_names]
+        print(f"[SEMANTIC FILTER] Cooldown aktif — bypass, {len(fast)} tools wajib dimuat.")
+        return fast if fast else all_tools
+
     # 1. Dapatkan embedding dari prompt
     prompt_emb = await _get_text_embedding(prompt)
     if not prompt_emb:
         print("[SEMANTIC FILTER] Bypassing filter karena kegagalan pembuatan prompt embedding.")
         return all_tools
-        
+
     # 2. Pastikan embedding untuk seluruh tools sudah siap di cache
     await _prepare_tool_embeddings(all_tools)
-    
+
     # 3. Hitung similarity untuk masing-masing tool
     scored_tools = []
-    
-    # Tools wajib (system / general tools)
-    always_include_names = {
-        "get_current_time", "calculate", "update_session_context", 
-        "waktu_sekarang", "info_sistem"
-    }
-    
-    if always_include_device_tools:
-        always_include_names.update([
-            "open_app", "list_files", "read_file", "get_latest_photo", 
-            "click_text", "input_text", "list_installed_apps", "read_screen"
-        ])
-        
+
     for t in all_tools:
         name = t["function"]["name"] if "function" in t else t.get("name")
         if name in always_include_names:
@@ -620,7 +697,7 @@ class AgentEngine:
         )
         system_content = f"{self._agent_instruction}\n\n{lang_instruction}"
 
-        is_portfolio = self._agent_personality.get("assistant_id") == "robin_ai_assistant"
+        is_portfolio = is_portfolio_persona(self._agent_personality)
         # 1. Ambil tools dari cache global dan filter dengan heuristik (0ms overhead)
         all_tools = await get_mcp_tools()
         tools = await _filter_relevant_tools(prompt, all_tools, always_include_device_tools=is_portfolio) if all_tools else []
@@ -730,54 +807,51 @@ class AgentEngine:
 
             if non_device_calls:
                 try:
-                    async with streamablehttp_client(MCP_URL) as (read, write, _):
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            
-                            for tc in non_device_calls:
-                                tool_name = tc["function"]["name"]
-                                args_str = tc["function"]["arguments"] or "{}"
-                                
-                                try:
-                                    tool_args = json.loads(args_str)
-                                except Exception:
-                                    tool_args = {}
-                                    
-                                if session_id and (tool_name == "buat_booking" or "session_id" in tool_args):
-                                    tool_args["session_id"] = session_id
+                    async with _mcp_session() as session:
+                        for tc in non_device_calls:
+                            tool_name = tc["function"]["name"]
+                            args_str = tc["function"]["arguments"] or "{}"
 
-                                print(f"[OPENAI MCP] Calling tool: '{tool_name}' with args: {tool_args}")
-                                
-                                is_authorized = True
-                                if admin_role == "sales":
-                                    is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
-                                    if not is_authorized:
-                                        result_text = f"Error: {auth_error}"
-                                
-                                if is_authorized:
-                                    try:
-                                        result = await session.call_tool(tool_name, tool_args)
-                                        # Ekstrak konten teks dari hasil tool eksekusi
-                                        result_text = ""
-                                        if hasattr(result, "content") and result.content:
-                                            for part in result.content:
-                                                if hasattr(part, "text") and part.text:
-                                                    result_text += part.text
-                                                elif isinstance(part, dict) and part.get("type") == "text":
-                                                    result_text += part.get("text", "")
-                                                else:
-                                                    result_text += str(part)
-                                        else:
-                                            result_text = str(result)
-                                    except Exception as e:
-                                        result_text = f"Error executing tool: {str(e)}"
-                                    
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "name": tool_name,
-                                    "content": result_text
-                                })
+                            try:
+                                tool_args = json.loads(args_str)
+                            except Exception:
+                                tool_args = {}
+
+                            if session_id and (tool_name == "buat_booking" or "session_id" in tool_args):
+                                tool_args["session_id"] = session_id
+
+                            print(f"[OPENAI MCP] Calling tool: '{tool_name}' with args: {tool_args}")
+
+                            is_authorized = True
+                            if admin_role == "sales":
+                                is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
+                                if not is_authorized:
+                                    result_text = f"Error: {auth_error}"
+
+                            if is_authorized:
+                                try:
+                                    result = await session.call_tool(tool_name, tool_args)
+                                    # Ekstrak konten teks dari hasil tool eksekusi
+                                    result_text = ""
+                                    if hasattr(result, "content") and result.content:
+                                        for part in result.content:
+                                            if hasattr(part, "text") and part.text:
+                                                result_text += part.text
+                                            elif isinstance(part, dict) and part.get("type") == "text":
+                                                result_text += part.get("text", "")
+                                            else:
+                                                result_text += str(part)
+                                    else:
+                                        result_text = str(result)
+                                except Exception as e:
+                                    result_text = f"Error executing tool: {str(e)}"
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": tool_name,
+                                "content": result_text
+                            })
                 except Exception as conn_err:
                     print(f"[OPENAI MCP CONNECTION ERROR] Failed to connect for tool calling: {conn_err}")
                     for tc in non_device_calls:
@@ -791,7 +865,7 @@ class AgentEngine:
             # Invalidate cache Redis setelah all tools selesai dijalankan
             if session_id:
                 from services.redis_service import redis_client
-                is_portfolio = self._agent_personality.get("assistant_id") == "robin_ai_assistant"
+                is_portfolio = is_portfolio_persona(self._agent_personality)
                 sess_key = f"pa:session:{session_id}" if is_portfolio else f"session:{session_id}"
                 msg_key = f"pa:messages:{session_id}" if is_portfolio else f"messages:{session_id}"
                 try:
@@ -805,6 +879,7 @@ class AgentEngine:
 class GeminiAgentEngine:
     def __init__(self, persona_file="agents/kurisu.json"):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        self.last_model_used = CHAT_PRIMARY_MODEL
         with open(persona_file, "r", encoding="utf-8") as person:
             self._agent_personality = json.load(person)
 
@@ -818,7 +893,7 @@ class GeminiAgentEngine:
         )
         system_content = f"{self._agent_instruction}\n\n{lang_instruction}"
 
-        is_portfolio = self._agent_personality.get("assistant_id") == "robin_ai_assistant"
+        is_portfolio = is_portfolio_persona(self._agent_personality)
         # 1. Ambil tools dari cache global dan filter dengan heuristik (0ms overhead)
         all_tools = await get_mcp_tools()
         tools = await _filter_relevant_tools(prompt, all_tools, always_include_device_tools=is_portfolio) if all_tools else []
@@ -846,40 +921,65 @@ class GeminiAgentEngine:
         ]
         
         # 2. Jalankan Agentic Loop (Mendukung tool calling berulang dengan streaming)
+        # Model: primer 3.1-flash-lite, fallback 3.5-flash-lite bila limit/overload.
+        chat_models = [CHAT_PRIMARY_MODEL]
+        if CHAT_FALLBACK_MODEL and CHAT_FALLBACK_MODEL != CHAT_PRIMARY_MODEL:
+            chat_models.append(CHAT_FALLBACK_MODEL)
         while True:
-            response_stream = await self.client.aio.models.generate_content_stream(
-                model="gemini-3.1-flash-lite",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(
-                        thinking_budget=0,  # untuk menonaktifkan thinking model
-                    ),
-                    system_instruction=system_content,
-                    tools=genai_tools if genai_tools else None,
-                )
-            )
             current_content = ""
             current_tool_calls = []
             model_parts = []
-            
-            async for chunk in response_stream:
-                # 1. Stream content to client (only if chunk has text to prevent warnings)
-                has_text = False
-                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
-                    for part in chunk.candidates[0].content.parts:
-                        if part.text:
-                            has_text = True
-                
-                if has_text and chunk.text:
-                    current_content += chunk.text
-                    yield f"data: {json.dumps({'text': chunk.text})}\n\n"
-                    
-                # 2. Collect parts and function calls
-                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
-                    for part in chunk.candidates[0].content.parts:
-                        model_parts.append(part)
-                        if part.function_call:
-                            current_tool_calls.append(part.function_call)
+            streamed_any = False
+            for attempt_model in chat_models:
+                try:
+                    if attempt_model != chat_models[0]:
+                        print(f"[GEMINI] Fallback ke {attempt_model} (model primer limit/error).")
+                    response_stream = await self.client.aio.models.generate_content_stream(
+                        model=attempt_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=0,  # untuk menonaktifkan thinking model
+                            ),
+                            system_instruction=system_content,
+                            tools=genai_tools if genai_tools else None,
+                        )
+                    )
+                    async for chunk in response_stream:
+                        # 1. Stream content to client (only if chunk has text to prevent warnings)
+                        has_text = False
+                        if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                            for part in chunk.candidates[0].content.parts:
+                                if part.text:
+                                    has_text = True
+
+                        if has_text and chunk.text:
+                            current_content += chunk.text
+                            streamed_any = True
+                            yield f"data: {json.dumps({'text': chunk.text})}\n\n"
+
+                        # 2. Collect parts and function calls
+                        if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                            for part in chunk.candidates[0].content.parts:
+                                model_parts.append(part)
+                                if part.function_call:
+                                    streamed_any = True
+                                    current_tool_calls.append(part.function_call)
+                    break  # sukses — keluar dari loop fallback
+                except Exception as stream_err:
+                    is_last = attempt_model == chat_models[-1]
+                    # Error tanpa pesan tidak bisa diklasifikasi — anggap retryable
+                    # (coba fallback) daripada langsung menyerah.
+                    retryable = _is_gemini_retryable(stream_err) or not str(stream_err).strip()
+                    # Hanya fallback bila belum ada output sama sekali (aman tanpa duplikasi).
+                    if is_last or streamed_any or not retryable:
+                        raise
+                    print(f"[GEMINI WARN] {attempt_model} gagal ({stream_err or type(stream_err).__name__}); coba fallback.")
+                    current_content = ""
+                    current_tool_calls = []
+                    model_parts = []
+                    continue
+            self.last_model_used = attempt_model
 
             # Jika tidak ada panggilan tool, loop selesai
             if not current_tool_calls:
@@ -930,52 +1030,49 @@ class GeminiAgentEngine:
 
             if non_device_calls:
                 try:
-                    async with streamablehttp_client(MCP_URL) as (read, write, _):
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            
-                            for fc in non_device_calls:
-                                tool_name = fc.name
-                                try:
-                                    tool_args = dict(fc.args) if fc.args else {}
-                                except Exception:
-                                    tool_args = {}
-                                
-                                if session_id and (tool_name == "buat_booking" or "session_id" in tool_args):
-                                    tool_args["session_id"] = session_id
+                    async with _mcp_session() as session:
+                        for fc in non_device_calls:
+                            tool_name = fc.name
+                            try:
+                                tool_args = dict(fc.args) if fc.args else {}
+                            except Exception:
+                                tool_args = {}
 
-                                print(f"[GEMINI SDK MCP] Calling tool: '{tool_name}' with args: {tool_args}")
-                                
-                                is_authorized = True
-                                if admin_role == "sales":
-                                    is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
-                                    if not is_authorized:
-                                        result_text = f"Error: {auth_error}"
-                                
-                                if is_authorized:
-                                    try:
-                                        result = await session.call_tool(tool_name, tool_args)
-                                        # Ekstrak konten teks dari hasil tool eksekusi
-                                        result_text = ""
-                                        if hasattr(result, "content") and result.content:
-                                            for part in result.content:
-                                                if hasattr(part, "text") and part.text:
-                                                    result_text += part.text
-                                                elif isinstance(part, dict) and part.get("type") == "text":
-                                                    result_text += part.get("text", "")
-                                                else:
-                                                    result_text += str(part)
-                                        else:
-                                            result_text = str(result)
-                                    except Exception as e:
-                                        result_text = f"Error executing tool: {str(e)}"
-                                    
-                                tool_response_parts.append(
-                                    types.Part.from_function_response(
-                                        name=tool_name,
-                                        response={"result": result_text}
-                                    )
+                            if session_id and (tool_name == "buat_booking" or "session_id" in tool_args):
+                                tool_args["session_id"] = session_id
+
+                            print(f"[GEMINI SDK MCP] Calling tool: '{tool_name}' with args: {tool_args}")
+
+                            is_authorized = True
+                            if admin_role == "sales":
+                                is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
+                                if not is_authorized:
+                                    result_text = f"Error: {auth_error}"
+
+                            if is_authorized:
+                                try:
+                                    result = await session.call_tool(tool_name, tool_args)
+                                    # Ekstrak konten teks dari hasil tool eksekusi
+                                    result_text = ""
+                                    if hasattr(result, "content") and result.content:
+                                        for part in result.content:
+                                            if hasattr(part, "text") and part.text:
+                                                result_text += part.text
+                                            elif isinstance(part, dict) and part.get("type") == "text":
+                                                result_text += part.get("text", "")
+                                            else:
+                                                result_text += str(part)
+                                    else:
+                                        result_text = str(result)
+                                except Exception as e:
+                                    result_text = f"Error executing tool: {str(e)}"
+
+                            tool_response_parts.append(
+                                types.Part.from_function_response(
+                                    name=tool_name,
+                                    response={"result": result_text}
                                 )
+                            )
                 except Exception as conn_err:
                     import traceback
                     print(f"[GEMINI SDK MCP CONNECTION ERROR] Failed to connect for tool calling:\n{traceback.format_exc()}")
@@ -990,7 +1087,7 @@ class GeminiAgentEngine:
             # Invalidate cache Redis setelah all tools selesai dijalankan
             if session_id:
                 from services.redis_service import redis_client
-                is_portfolio = self._agent_personality.get("assistant_id") == "robin_ai_assistant"
+                is_portfolio = is_portfolio_persona(self._agent_personality)
                 sess_key = f"pa:session:{session_id}" if is_portfolio else f"session:{session_id}"
                 msg_key = f"pa:messages:{session_id}" if is_portfolio else f"messages:{session_id}"
                 try:

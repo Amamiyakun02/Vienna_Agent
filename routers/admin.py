@@ -2,24 +2,49 @@ from fastapi import APIRouter, HTTPException, Query, Body, Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from bson import ObjectId
-from pydantic import BaseModel
+from bson.errors import InvalidId
+from pydantic import BaseModel, Field
 
 from services.mongo_service import users_col, sessions_col, messages_col, documents_col, feedbacks_col
 
 router = APIRouter(prefix="/v1/admin", tags=["Admin Management"])
 
+MAX_PAGE_SIZE = 200
+
+
+def cap_limit(limit: int) -> int:
+    return max(1, min(limit, MAX_PAGE_SIZE))
+
+
 def serialize_mongo(doc):
     if not doc:
         return None
+    doc = dict(doc)
     if "_id" in doc:
         doc["_id"] = str(doc["_id"])
     return doc
+
+
+def to_object_id(value: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "ID tidak valid.")
+
+
+class FeedbackCreate(BaseModel):
+    customer_name: str = Field(..., min_length=1, max_length=100)
+    rating: str = Field(default="5", max_length=10)
+    category: str = Field(default="general", max_length=50)
+    content: str = Field(..., min_length=1, max_length=5000)
+    status: str = Field(default="new", max_length=20)
 
 # =======================
 # USERS
 # =======================
 @router.get("/users")
 async def get_users(limit: int = 100, skip: int = 0):
+    limit = cap_limit(limit)
     cursor = users_col.find().sort("created_at", -1).skip(skip).limit(limit)
     users = await cursor.to_list(length=limit)
     return [serialize_mongo(u) for u in users]
@@ -33,33 +58,28 @@ async def create_user(payload: dict = Body(...)):
 
 @router.put("/users/{user_id}")
 async def update_user(user_id: str, payload: dict = Body(...)):
-    try:
-        obj_id = ObjectId(user_id)
-        if "_id" in payload:
-            del payload["_id"]
-        res = await users_col.update_one({"_id": obj_id}, {"$set": payload})
-        if res.matched_count == 0:
-            raise HTTPException(404, "User not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(user_id)
+    if "_id" in payload:
+        del payload["_id"]
+    res = await users_col.update_one({"_id": obj_id}, {"$set": payload})
+    if res.matched_count == 0:
+        raise HTTPException(404, "User not found")
+    return {"status": "success"}
 
 @router.delete("/users/{user_id}")
 async def delete_user(user_id: str):
-    try:
-        obj_id = ObjectId(user_id)
-        res = await users_col.delete_one({"_id": obj_id})
-        if res.deleted_count == 0:
-            raise HTTPException(404, "User not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(user_id)
+    res = await users_col.delete_one({"_id": obj_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "User not found")
+    return {"status": "success"}
 
 # =======================
 # CHAT SESSIONS
 # =======================
 @router.get("/chatsessions")
 async def get_sessions(limit: int = 100, skip: int = 0):
+    limit = cap_limit(limit)
     cursor = sessions_col.find().sort("created_at", -1).skip(skip).limit(limit)
     sessions = await cursor.to_list(length=limit)
     return [serialize_mongo(s) for s in sessions]
@@ -78,6 +98,7 @@ async def delete_session(session_id: str):
 # =======================
 @router.get("/messages")
 async def get_all_messages(session_id: Optional[str] = None, limit: int = 100, skip: int = 0):
+    limit = cap_limit(limit)
     query = {}
     if session_id:
         query["session_id"] = session_id
@@ -90,6 +111,7 @@ async def get_all_messages(session_id: Optional[str] = None, limit: int = 100, s
 # =======================
 @router.get("/documents")
 async def get_documents(limit: int = 100, skip: int = 0):
+    limit = cap_limit(limit)
     # Documents might use 'timestamp' or 'created_at' depending on how it's populated.
     # Usually we just return list
     cursor = documents_col.find().skip(skip).limit(limit)
@@ -105,67 +127,56 @@ async def create_document(payload: dict = Body(...)):
 
 @router.put("/documents/{doc_id}")
 async def update_document(doc_id: str, payload: dict = Body(...)):
-    try:
-        obj_id = ObjectId(doc_id)
-        if "_id" in payload:
-            del payload["_id"]
-        res = await documents_col.update_one({"_id": obj_id}, {"$set": payload})
-        if res.matched_count == 0:
-            raise HTTPException(404, "Document not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(doc_id)
+    if "_id" in payload:
+        del payload["_id"]
+    res = await documents_col.update_one({"_id": obj_id}, {"$set": payload})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Document not found")
+    return {"status": "success"}
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    try:
-        obj_id = ObjectId(doc_id)
-        res = await documents_col.delete_one({"_id": obj_id})
-        if res.deleted_count == 0:
-            raise HTTPException(404, "Document not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(doc_id)
+    res = await documents_col.delete_one({"_id": obj_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Document not found")
+    return {"status": "success"}
 
 # =======================
 # FEEDBACKS
 # =======================
 @router.get("/feedbacks")
 async def get_feedbacks(limit: int = 100, skip: int = 0):
+    limit = cap_limit(limit)
     cursor = feedbacks_col.find().sort("created_at", -1).skip(skip).limit(limit)
     feedbacks = await cursor.to_list(length=limit)
     return [serialize_mongo(f) for f in feedbacks]
 
 @router.post("/feedbacks")
-async def create_feedback(payload: dict = Body(...)):
-    doc = {**payload, "created_at": datetime.now(timezone.utc)}
+async def create_feedback(payload: FeedbackCreate):
+    doc = {**payload.model_dump(), "created_at": datetime.now(timezone.utc)}
     res = await feedbacks_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
     return doc
 
 @router.put("/feedbacks/{feedback_id}")
 async def update_feedback(feedback_id: str, payload: dict = Body(...)):
-    try:
-        obj_id = ObjectId(feedback_id)
-        if "_id" in payload:
-            del payload["_id"]
-        res = await feedbacks_col.update_one({"_id": obj_id}, {"$set": payload})
-        if res.matched_count == 0:
-            raise HTTPException(404, "Feedback not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(feedback_id)
+    if "_id" in payload:
+        del payload["_id"]
+    res = await feedbacks_col.update_one({"_id": obj_id}, {"$set": payload})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Feedback not found")
+    return {"status": "success"}
 
 @router.delete("/feedbacks/{feedback_id}")
 async def delete_feedback(feedback_id: str):
-    try:
-        obj_id = ObjectId(feedback_id)
-        res = await feedbacks_col.delete_one({"_id": obj_id})
-        if res.deleted_count == 0:
-            raise HTTPException(404, "Feedback not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    obj_id = to_object_id(feedback_id)
+    res = await feedbacks_col.delete_one({"_id": obj_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Feedback not found")
+    return {"status": "success"}
 
 # =======================
 # STATS

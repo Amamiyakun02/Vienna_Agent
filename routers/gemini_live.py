@@ -106,7 +106,7 @@ async def websocket_endpoint(client_ws: WebSocket):
                 user_doc = None
                 try:
                     user_doc = await users_col.find_one({"_id": ObjectId(user_id)})
-                except:
+                except Exception:
                     user_doc = await users_col.find_one({"_id": user_id})
                 if user_doc:
                     user_info = {"name": user_doc.get("name"), "phone": user_doc.get("phone"), "email": user_doc.get("email")}

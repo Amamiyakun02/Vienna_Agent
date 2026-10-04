@@ -97,6 +97,55 @@ device_app_inventory_col = db["device_app_inventory"]
 
 
 # ======================
+# INDEXES
+# ======================
+
+async def ensure_mongo_indexes():
+    """Buat index yang dipakai path chat. Idempotent — aman dipanggil tiap startup."""
+    try:
+        await messages_col.create_index([("session_id", 1), ("timestamp", -1)], background=True)
+        await sessions_col.create_index([("session_id", 1)], background=True)
+        await sessions_col.create_index([("user_id", 1)], background=True)
+        print("[MONGO] Chat indexes ensured.")
+    except Exception as e:
+        print(f"[MONGO WARN] Failed to ensure indexes: {e}")
+
+
+# ======================
+# MEMORY LIMITS (bisa di-override via env)
+# ======================
+MAX_MSGS_PER_SESSION = int(os.getenv("MAX_MSGS_PER_SESSION", "100"))
+SESSION_IDLE_DAYS = int(os.getenv("SESSION_IDLE_DAYS", "7"))
+
+
+async def count_session_messages(session_id: str, is_portfolio: bool = False) -> int:
+    """Hitung jumlah pesan dalam satu session (untuk keputusan rotasi)."""
+    col = pa_messages_col if is_portfolio else messages_col
+    try:
+        return await col.count_documents({"session_id": session_id})
+    except Exception as e:
+        print(f"[MONGO WARN] Failed to count messages: {e}")
+        return 0
+
+
+async def archive_session(session_id: str, is_portfolio: bool = False):
+    """Tandai session sebagai tidak aktif (arsip). Data tetap tersimpan."""
+    col = pa_sessions_col if is_portfolio else sessions_col
+    try:
+        await col.update_one(
+            {"session_id": session_id},
+            {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
+        )
+        try:
+            cache_key = f"pa:session:{session_id}" if is_portfolio else f"session:{session_id}"
+            await redis_client.delete(cache_key)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[MONGO WARN] Failed to archive session: {e}")
+
+
+# ======================
 # SESSION HANDLERS
 # ======================
 
@@ -133,7 +182,9 @@ async def create_session(user_id: str, session_id: str = None, platform: str = "
     col = pa_sessions_col if is_portfolio else sessions_col
 
     if not session_id:
-        session_id = f"sess_{now.strftime('%Y%m%d_%H%M%S%f')}"
+        # Suffix acak agar tidak bisa ditebak (ID timestamp murni bisa ditebak
+        # penyerang dalam window waktu yang sama -> risiko session hijack).
+        session_id = f"sess_{now.strftime('%Y%m%d_%H%M%S%f')}_{uuid.uuid4().hex[:12]}"
 
     if context is None:
         if is_portfolio:
@@ -246,7 +297,10 @@ async def get_or_create_session(user_id: str, session_id: str = None, role: str 
             cached = await redis_client.get(cache_key)
             if cached:
                 session_obj = deserialize_from_cache(cached)
-                if session_obj and ( "role" not in session_obj or session_obj.get("role") != role ):
+                # Kepemilikan: session milik user lain TIDAK boleh dipakai.
+                if session_obj and str(session_obj.get("user_id", "")) != str(user_id):
+                    print(f"[SECURITY] session_id milik user lain ditolak (user={user_id}).")
+                elif session_obj and ( "role" not in session_obj or session_obj.get("role") != role ):
                     # Cache is stale in terms of role, delete it and load from DB
                     try:
                         await redis_client.delete(cache_key)
@@ -258,6 +312,16 @@ async def get_or_create_session(user_id: str, session_id: str = None, role: str 
             print(f"[REDIS WARN] Failed to get session cache: {e}")
 
         existing = await col.find_one({"session_id": session_id})
+        if existing and str(existing.get("user_id", "")) != str(user_id):
+            # Session milik user lain — buang klaimnya agar create_session di
+            # bawah TIDAK memakai ulang ID tersebut (anti session-hijack).
+            print(f"[SECURITY] session_id milik user lain ditolak (user={user_id}).")
+            existing = None
+            session_id = None
+            try:
+                await redis_client.delete(cache_key)
+            except Exception:
+                pass
         if existing:
             if "role" not in existing or existing.get("role") != role:
                 existing["role"] = role
@@ -272,7 +336,32 @@ async def get_or_create_session(user_id: str, session_id: str = None, role: str 
 
     existing = await col.find_one({"user_id": user_id})
     if existing:
-        sess_id = existing.get("session_id")
+        # Rotasi otomatis: session implicit yang kepenuhan / lama tidak aktif
+        # diganti session baru (yang lama diarsip, data tetap ada).
+        # Tidak berlaku bila client meminta session_id eksplisit (lanjutkan riwayat).
+        if not session_id:
+            sess_id = existing.get("session_id")
+            try:
+                msg_count = await count_session_messages(sess_id, is_portfolio=is_portfolio)
+            except Exception:
+                msg_count = 0
+            last_active = existing.get("last_activity") or existing.get("updated_at")
+            idle_days = 0
+            if isinstance(last_active, str):
+                try:
+                    last_active = datetime.fromisoformat(last_active)
+                except Exception:
+                    last_active = None
+            if isinstance(last_active, datetime):
+                if last_active.tzinfo is None:
+                    last_active = last_active.replace(tzinfo=timezone.utc)
+                idle_days = (datetime.now(timezone.utc) - last_active).total_seconds() / 86400
+            if msg_count >= MAX_MSGS_PER_SESSION or idle_days >= SESSION_IDLE_DAYS:
+                print(f"[SESSION] Rotating session {sess_id} (msgs={msg_count}, idle={idle_days:.1f}d)")
+                await archive_session(sess_id, is_portfolio=is_portfolio)
+                existing = None  # lanjut ke pembuatan session baru di bawah
+        if existing:
+            sess_id = existing.get("session_id")
         if sess_id:
             cache_key = f"pa:session:{sess_id}" if is_portfolio else f"session:{sess_id}"
             if "role" not in existing or existing.get("role") != role:
@@ -383,7 +472,17 @@ async def save_message(session_id: str, sender: str, content: str, message_type:
         "timestamp": datetime.now(timezone.utc)
     }
     await col.insert_one(doc)
-    
+
+    # Rawat last_activity session agar rotasi idle akurat (1 update ringan per pesan)
+    try:
+        sess_col = pa_sessions_col if is_portfolio else sessions_col
+        await sess_col.update_one(
+            {"session_id": session_id},
+            {"$set": {"last_activity": datetime.now(timezone.utc)}}
+        )
+    except Exception as e:
+        print(f"[MONGO WARN] Failed to touch session activity: {e}")
+
     # Invalidate cache messages agar data di-fetch segar dari DB pada pemanggilan get_messages berikutnya
     cache_key = f"pa:messages:{session_id}" if is_portfolio else f"messages:{session_id}"
     try:

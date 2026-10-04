@@ -1,13 +1,27 @@
 import os
+import re
 import time
 import tempfile
 import numpy as np
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF (pakai namespace baru — `import pymupdf` deprecated)
 from typing import List, Optional
 from fastapi import APIRouter, UploadFile, File, Query, Form, HTTPException, status, Response
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/v1/pdf", tags=["PDF Analysis"])
+
+MAX_PDF_BYTES = 25 * 1024 * 1024  # 25 MB per PDF upload
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per image
+MAX_IMAGES_PER_REQUEST = 10
+MAX_PDF_PAGES = 500
+
+
+def safe_attachment_filename(name: str, fallback: str) -> str:
+    """Strip path separators, quotes, and control chars to prevent header injection."""
+    base = os.path.basename(name or fallback)
+    base = re.sub(r'[\r\n"\'\\\\]', "", base)
+    base = base.strip() or fallback
+    return base[:120]
 
 class PDFPageDetail(BaseModel):
     page: int
@@ -76,6 +90,16 @@ async def check_pdf_color(
         # Tulis konten file ke temp
         content = await file.read()
         file_size = len(content)
+        if file_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File PDF kosong."
+            )
+        if file_size > MAX_PDF_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File PDF terlalu besar (maks {MAX_PDF_BYTES // (1024 * 1024)} MB)."
+            )
         temp_file.write(content)
         temp_file.close()
         
@@ -83,7 +107,7 @@ async def check_pdf_color(
         start_time = time.time()
         
         try:
-            doc = fitz.open(temp_path)
+            doc = pymupdf.open(temp_path)
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -98,6 +122,16 @@ async def check_pdf_color(
                 )
                 
             total_pages = len(doc)
+            if total_pages == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Dokumen PDF tidak memiliki halaman."
+                )
+            if total_pages > MAX_PDF_PAGES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Dokumen terlalu panjang (maks {MAX_PDF_PAGES} halaman)."
+                )
             colored_pages = []
             grayscale_pages = []
             pages_details = []
@@ -192,6 +226,16 @@ async def check_pdf_color(
 async def convert_images_to_pdf(
     files: List[UploadFile] = File(...)
 ):
+    if len(files) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tidak ada gambar yang diunggah."
+        )
+    if len(files) > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Terlalu banyak gambar (maks {MAX_IMAGES_PER_REQUEST} per permintaan)."
+        )
     valid_extensions = {".jpg", ".jpeg", ".png"}
     for file in files:
         ext = os.path.splitext(file.filename)[1].lower()
@@ -201,19 +245,29 @@ async def convert_images_to_pdf(
                 detail=f"Format file tidak didukung: {file.filename}. Hanya file JPG, JPEG, dan PNG yang diperbolehkan."
             )
 
-    doc = fitz.open()
+    doc = pymupdf.open()
     try:
         for file in files:
             content = await file.read()
+            if len(content) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"File gambar kosong: {file.filename}."
+                )
+            if len(content) > MAX_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Gambar {file.filename} terlalu besar (maks {MAX_IMAGE_BYTES // (1024 * 1024)} MB)."
+                )
             ext = os.path.splitext(file.filename)[1].lower().replace(".", "")
             if ext == "jpg":
                 ext = "jpeg"
                 
             try:
                 # Buka gambar menggunakan PyMuPDF
-                img_doc = fitz.open(stream=content, filetype=ext)
+                img_doc = pymupdf.open(stream=content, filetype=ext)
                 pdf_bytes = img_doc.convert_to_pdf()
-                img_page = fitz.open("pdf", pdf_bytes)
+                img_page = pymupdf.open("pdf", pdf_bytes)
                 doc.insert_pdf(img_page)
                 img_doc.close()
                 img_page.close()
@@ -280,8 +334,18 @@ async def cut_pdf(
         )
 
     content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File PDF kosong."
+        )
+    if len(content) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File PDF terlalu besar (maks {MAX_PDF_BYTES // (1024 * 1024)} MB)."
+        )
     try:
-        doc = fitz.open(stream=content, filetype="pdf")
+        doc = pymupdf.open(stream=content, filetype="pdf")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -297,7 +361,7 @@ async def cut_pdf(
                 detail="Tidak ada halaman valid yang dipilih untuk dipotong."
             )
 
-        new_doc = fitz.open()
+        new_doc = pymupdf.open()
         for idx in indices:
             new_doc.insert_pdf(doc, from_page=idx - 1, to_page=idx - 1)
 
@@ -305,8 +369,8 @@ async def cut_pdf(
         new_doc.close()
 
         # Generate output filename
-        orig_base = os.path.splitext(file.filename)[0]
-        out_filename = f"{orig_base}_cut.pdf"
+        orig_base = os.path.splitext(safe_attachment_filename(file.filename, "document.pdf"))[0]
+        out_filename = safe_attachment_filename(f"{orig_base}_cut.pdf", "document_cut.pdf")
 
         return Response(
             content=pdf_bytes,

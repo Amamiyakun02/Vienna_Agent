@@ -10,7 +10,7 @@ from services.mongo_service import (
     documents_col,
     pa_documents_col
 )
-from utils.embedding import gpt_embedding
+from utils.embedding import embed_text, EMBEDDING_DIM, EMBEDDING_PROVIDER
 
 # Names of collections in Qdrant
 DOCUMENT_COLLECTION = "document_chunk"
@@ -18,36 +18,53 @@ PORTFOLIO_DOCUMENT_COLLECTION = "portfolio_document_chunk"
 
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+async def _ensure_collection(client, name: str):
+    """Pastikan koleksi ada dengan dimensi sesuai EMBEDDING_PROVIDER aktif.
+
+    Bila koleksi ada tapi dimensinya beda (mis. pindah openai 1536 -> gemini
+    768), koleksi di-recreate kosong — vektor lama beda ruang embedding dan
+    tidak bisa dipakai query baru. Isi ulang via ingest_document_embedding.
+    """
+    try:
+        info = await client.get_collection(name)
+        current_size = info.config.params.vectors.size
+        if current_size == EMBEDDING_DIM:
+            print(f"[OK] Qdrant collection '{name}' already exists "
+                  f"(dim={current_size}, provider={EMBEDDING_PROVIDER}).")
+            return
+        print(f"[MIGRATE] Collection '{name}' dim={current_size} != {EMBEDDING_DIM} "
+              f"(provider={EMBEDDING_PROVIDER}) — recreating...")
+        await client.delete_collection(name)
+    except UnexpectedResponse as e:
+        if e.status_code != 404:
+            print(f"[ERROR] Qdrant connection/response error for '{name}': {e}")
+            raise e
+    except Exception as e:
+        # delete_collection pada koleksi tak ada / error koneksi — lanjut ke create
+        print(f"[INFO] Recreating Qdrant collection '{name}': {e}")
+    print(f"Creating Qdrant collection '{name}' (dim={EMBEDDING_DIM})...")
+    await client.create_collection(
+        collection_name=name,
+        vectors_config=models.VectorParams(
+            size=EMBEDDING_DIM,
+            distance=models.Distance.COSINE
+        )
+    )
+    print(f"[OK] Qdrant collection '{name}' created successfully.")
+
+
 async def initialize_qdrant_collections():
     """
-    Ensures that Qdrant collections exist.
-    Creates them with 1536-dimensional vectors using Cosine distance if they don't exist.
+    Ensures that Qdrant collections exist with dimensions matching the
+    active EMBEDDING_PROVIDER (gemini=768, openai=1536), Cosine distance.
+    Dipanggil tiap startup (lihat lifespan di main.py).
     """
     client = await get_qdrant_client()
 
     # Removed product collection logic
 
     # 2. Document Chunk Collection
-    try:
-        await client.get_collection(DOCUMENT_COLLECTION)
-        print(f"[OK] Qdrant collection '{DOCUMENT_COLLECTION}' already exists.")
-    except UnexpectedResponse as e:
-        if e.status_code == 404:
-            print(f"Creating Qdrant collection '{DOCUMENT_COLLECTION}'...")
-            await client.create_collection(
-                collection_name=DOCUMENT_COLLECTION,
-                vectors_config=models.VectorParams(
-                    size=1536,
-                    distance=models.Distance.COSINE
-                )
-            )
-            print(f"[OK] Qdrant collection '{DOCUMENT_COLLECTION}' created successfully.")
-        else:
-            print(f"[ERROR] Qdrant connection/response error for '{DOCUMENT_COLLECTION}': {e}")
-            raise e
-    except Exception as e:
-        print(f"[ERROR] Failed to query Qdrant collection '{DOCUMENT_COLLECTION}': {e}")
-        raise e
+    await _ensure_collection(client, DOCUMENT_COLLECTION)
 
     # Ensure document_id payload index exists for deletes & filters
     try:
@@ -61,26 +78,7 @@ async def initialize_qdrant_collections():
         print(f"[WARNING] Could not create/verify payload index: {e}")
 
     # 3. Portfolio Document Chunk Collection
-    try:
-        await client.get_collection(PORTFOLIO_DOCUMENT_COLLECTION)
-        print(f"[OK] Qdrant collection '{PORTFOLIO_DOCUMENT_COLLECTION}' already exists.")
-    except UnexpectedResponse as e:
-        if e.status_code == 404:
-            print(f"Creating Qdrant collection '{PORTFOLIO_DOCUMENT_COLLECTION}'...")
-            await client.create_collection(
-                collection_name=PORTFOLIO_DOCUMENT_COLLECTION,
-                vectors_config=models.VectorParams(
-                    size=1536,
-                    distance=models.Distance.COSINE
-                )
-            )
-            print(f"[OK] Qdrant collection '{PORTFOLIO_DOCUMENT_COLLECTION}' created successfully.")
-        else:
-            print(f"[ERROR] Qdrant connection/response error for '{PORTFOLIO_DOCUMENT_COLLECTION}': {e}")
-            raise e
-    except Exception as e:
-        print(f"[ERROR] Failed to query Qdrant collection '{PORTFOLIO_DOCUMENT_COLLECTION}': {e}")
-        raise e
+    await _ensure_collection(client, PORTFOLIO_DOCUMENT_COLLECTION)
 
     # Ensure document_id payload index exists for portfolio deletes & filters
     try:
@@ -149,9 +147,9 @@ async def ingest_document_embedding(
         # 3. Create embeddings for each chunk and prepare Qdrant points
         points = []
         for idx, chunk_text in enumerate(chunks):
-            embed_text = f"Document: {title} | Chunk {idx+1}/{len(chunks)}:\n{chunk_text}"
+            embed_source = f"Document: {title} | Chunk {idx+1}/{len(chunks)}:\n{chunk_text}"
 
-            vector = await asyncio.to_thread(gpt_embedding, embed_text)
+            vector = await asyncio.to_thread(embed_text, embed_source)
             if not vector:
                 print(f"[ERROR] Failed to generate embedding for doc {document_id} chunk {idx}.")
                 continue

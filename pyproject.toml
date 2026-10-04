@@ -32,4 +32,8 @@ dependencies = [
     "google-genai>=2.8.0",
     "firebase-admin>=7.4.0",
     "websockets>=15.0.1",
+    "yt-dlp>=2024.8.6",
+    "imageio-ffmpeg>=0.6.0",
+    # TLS impersonation Chrome untuk yt-dlp (lolos bot-check YouTube di IP cloud)
+    "curl-cffi>=0.5.0",
 ]
