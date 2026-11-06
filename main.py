@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
-from services import AgentEngine, GeminiAgentEngine
+from services import AgentEngine, GeminiAgentEngine, MercuryAgentEngine, DeepSeekAgentEngine
 from services.github_service import sync_github_repositories
 from utils.prompt_builder import build_prompt
 from typing import Optional, List, Dict, Any
@@ -39,6 +39,8 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5174",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3100",
+    "http://127.0.0.1:3100",
     "https://amamiyakun02.github.io",
     "https://smart-guide-ai-agent.vercel.app",
     "https://lina-deals.vercel.app",
@@ -70,12 +72,18 @@ async def lifespan(app: FastAPI):
         from services.rag_ingestion_service import initialize_qdrant_collections
         await initialize_qdrant_collections()
     except Exception as e:
-        print(f"[ERROR] Error during Qdrant startup initialization: {e}")
+        print(f"[ERROR] RAG/Qdrant init gagal — retrieval nonaktif: {e}")
     try:
         from services.mongo_service import ensure_mongo_indexes
         await ensure_mongo_indexes()
     except Exception as e:
         print(f"[ERROR] Error ensuring Mongo indexes: {e}")
+    # System Dashboard: buat tabel PostgreSQL + seed registry project.
+    try:
+        from services.dashboard_store import init_dashboard_db
+        await asyncio.to_thread(init_dashboard_db)
+    except Exception as e:
+        print(f"[ERROR] Init database dashboard gagal — modul data nonaktif: {e}")
 
     # Warmup koneksi agar pesan pertama tidak membayar TLS handshake (~6s).
     try:
@@ -146,6 +154,8 @@ app.add_middleware(
 
 agent_vienna = AgentEngine(persona_file="agents/vienna.json")
 agent_gemini = GeminiAgentEngine(persona_file="agents/vienna.json")
+agent_mercury = MercuryAgentEngine(persona_file="agents/vienna.json")
+agent_deepseek = DeepSeekAgentEngine(persona_file="agents/vienna.json")
 
 
 from routers.auth_api import router as auth_router
@@ -170,6 +180,11 @@ from routers.tools_api import router as tools_router, legacy_router as youtube_l
 app.include_router(tools_router)
 app.include_router(youtube_legacy_router)
 app.include_router(downloader_legacy_router)
+
+from routers.dashboard_api import public_router as public_projects_router
+from routers.dashboard_api import router as dashboard_router
+app.include_router(dashboard_router)
+app.include_router(public_projects_router)
 
 
 # ──────────────────────────────────────────────
@@ -579,19 +594,133 @@ async def gemini_chat(payload: ChatRequest = Body(...), request: Request = None)
     return await process_chat(payload, agent_gemini, request=request)
 
 
+@app.post("/v1/mercury/chat")
+@app.post("/v1/inception/chat")
+async def mercury_chat(payload: ChatRequest = Body(...), request: Request = None):
+    """Chat via Inception Labs Mercury (OpenAI-compatible).
+
+    Butuh MERCURY_API_KEY (atau INCEPTION_API_KEY). Model default `mercury-3`,
+    fallback `mercury-2.5` — bisa diatur lewat env MERCURY_MODEL dsb.
+    """
+    return await process_chat(payload, agent_mercury, request=request)
+
+
+@app.post("/v1/deepseek/chat")
+@app.post("/v1/larprouter/chat")
+async def deepseek_chat(payload: ChatRequest = Body(...), request: Request = None):
+    """Chat via DeepSeek usando LARP Router (API OpenAI-compatible)."""
+    return await process_chat(payload, agent_deepseek, request=request)
+
+
+@app.get("/v1/engines")
+async def list_engines():
+    """Daftar engine chat yang tersedia + status konfigurasi API key."""
+    return {
+        "status": "success",
+        "engines": [
+            {
+                "id": "gemini",
+                "label": "Google Gemini",
+                "model": os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash-lite"),
+                "endpoint": "/v1/gemini/chat",
+                "available": bool(os.getenv("GEMINI_API_KEY")),
+            },
+            {
+                "id": "mercury",
+                "label": "Inception Labs Mercury",
+                "provider": getattr(agent_mercury, "provider", "mercury"),
+                "model": getattr(agent_mercury, "model_name", "mercury-3"),
+                "endpoint": "/v1/mercury/chat",
+                "available": bool(getattr(agent_mercury, "available", False)),
+            },
+            {
+                "id": "deepseek",
+                "label": "DeepSeek via LARP Router",
+                "provider": getattr(agent_deepseek, "provider", "larprouter"),
+                "model": getattr(agent_deepseek, "model_name", "deepseek-v4.1-flash"),
+                "endpoint": "/v1/deepseek/chat",
+                "available": bool(getattr(agent_deepseek, "available", False)),
+            },
+        ],
+    }
+
+
+def _format_model_entry(model_id: str, owned_by: str, root: str, available: bool, tools: bool = True, vision: bool = False):
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 1720000000,
+        "owned_by": owned_by,
+        "root": root,
+        "parent": None,
+        "available": available,
+        "permission": [],
+        "capabilities": {
+            "tools": tools,
+            "vision": vision,
+        },
+    }
+
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models():
+    """Endpoint kompatibilitas OpenAI untuk discovery model (/v1/models)."""
+    gemini_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash-lite")
+    mercury_model = getattr(agent_mercury, "model_name", os.getenv("MERCURY_MODEL", "mercury-3"))
+    deepseek_model = getattr(agent_deepseek, "model_name", os.getenv("LARPROUTER_MODEL", "deepseek-v4.1-flash"))
+    gemini_avail = bool(os.getenv("GEMINI_API_KEY"))
+    mercury_avail = bool(getattr(agent_mercury, "available", False) or os.getenv("MERCURY_API_KEY") or os.getenv("INCEPTION_API_KEY"))
+    deepseek_avail = bool(getattr(agent_deepseek, "available", False) or os.getenv("LARPROUTER_API_KEY"))
+
+    data = [
+        _format_model_entry("gemini", "google", "gemini", gemini_avail, tools=True, vision=True),
+        _format_model_entry("mercury", "inception", "mercury", mercury_avail, tools=True, vision=False),
+        _format_model_entry("deepseek", "larprouter", "deepseek", deepseek_avail, tools=True, vision=False),
+        _format_model_entry("vienna", "vienna-agent", "vienna", True, tools=True, vision=True),
+    ]
+    if gemini_model not in ("gemini", ""):
+        data.append(_format_model_entry(gemini_model, "google", "gemini", gemini_avail, tools=True, vision=True))
+    if mercury_model not in ("mercury", ""):
+        data.append(_format_model_entry(mercury_model, "inception", "mercury", mercury_avail, tools=True, vision=False))
+    if deepseek_model not in ("deepseek", ""):
+        data.append(_format_model_entry(deepseek_model, "larprouter", "deepseek", deepseek_avail, tools=True, vision=False))
+
+    return {
+        "object": "list",
+        "data": data,
+    }
+
+
+@app.get("/v1/models/{model_id}")
+@app.get("/models/{model_id}")
+async def get_model(model_id: str):
+    """Endpoint kompatibilitas OpenAI untuk detail satu model."""
+    models_resp = await list_models()
+    for m in models_resp["data"]:
+        if m["id"].lower() == model_id.lower():
+            return m
+    return _format_model_entry(model_id, "vienna-agent", model_id, True, tools=True, vision=False)
+
+
 def _role_for_user(user_id: str) -> str:
     return "superadmin" if user_id.startswith("admin_") else "customer"
 
 
 def _engine_for(name: Optional[str]):
-    # NOTE (2026-09-29): paksa Gemini — jalur OpenAI nonaktif (credits habis).
-    # return agent_vienna if (name or "").lower() == "openai" else agent_gemini
+    # OpenAI/GPT masih nonaktif (credits habis). Gemini tetap default;
+    # Mercury dipilih eksplisit via engine="mercury" (atau nama modelnya).
+    normalized = (name or "").strip().lower()
+    if normalized in ("mercury", "inception", "mercury-3", "mercury-2.5", "mercury-2", "mercury-voice"):
+        return agent_mercury
+    if normalized in ("deepseek", "larprouter", "deepseek-v4.1-flash"):
+        return agent_deepseek
     return agent_gemini
 
 
 class NewSessionRequest(BaseModel):
     user_id: str
-    engine: Optional[str] = "gemini"  # "gemini" saja untuk kini ("openai" nonaktif — credits habis)
+    engine: Optional[str] = "gemini"  # "gemini" (default), "mercury", atau "deepseek"
     session_id: Optional[str] = None  # bila diisi: arsipkan session ini spesifik
 
 
@@ -661,7 +790,7 @@ async def assistant_list_sessions(user_id: str, engine: Optional[str] = "gemini"
 
 
 
-async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine, request: Request = None):
+async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine | MercuryAgentEngine | DeepSeekAgentEngine, request: Request = None):
     try:
         messages = payload.messages or []
         user_id = payload.user_id
@@ -805,6 +934,7 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
         # ======================
         async def streaming_wrapper():
             full_response = ""
+            stream_meta = {}
 
             try:
                 async for chunk in current_agent.chat(prompt, lang=payload.lang, session_id=session_id, user_id=user_id, admin_role=role):
@@ -822,6 +952,11 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
 
                         try:
                             data = json.loads(raw)
+                            if isinstance(data.get("meta"), dict):
+                                # Metadata internal engine (model/usage) — tidak
+                                # diteruskan ke client; dipakai untuk event done.
+                                stream_meta.update(data["meta"])
+                                continue
                             text_part = data.get("text", "")
                         except Exception:
                             text_part = ""
@@ -845,7 +980,8 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
                 try:
                     rag_chunks = [r for r in (retrieval or []) if r and r.strip()]
                     usage = {
-                        "model": getattr(current_agent, "last_model_used", "gemini-3.1-flash-lite"),
+                        "model": stream_meta.get("model") or getattr(current_agent, "last_model_used", "gemini-3.1-flash-lite"),
+                        "provider": getattr(current_agent, "provider", "gemini"),
                         "prompt_chars": len(prompt),
                         "history_chars": len(history_messages),
                         "response_chars": len(full_response),
@@ -853,6 +989,16 @@ async def process_chat(payload: ChatRequest, current_agent: AgentEngine | Gemini
                         "response_tokens_est": max(1, len(full_response) // 4),
                         "rag_chunks": len(rag_chunks),
                     }
+                    # Token usage asli dari event meta engine (Mercury). Fallback
+                    # ke atribut engine untuk engine lama (Gemini = estimasi).
+                    real_usage = stream_meta.get("usage")
+                    if not isinstance(real_usage, dict) or not real_usage:
+                        real_usage = getattr(current_agent, "last_usage", None)
+                    if isinstance(real_usage, dict) and real_usage:
+                        usage.update({
+                            k: v for k, v in real_usage.items()
+                            if k in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens")
+                        })
                     sources_preview = [s[:500] for s in rag_chunks[:3]]
                     yield f"data: {json.dumps({'done': True, 'usage': usage, 'sources': sources_preview})}\n\n"
                 except Exception as term_err:
@@ -935,4 +1081,3 @@ if __name__ == "__main__":
         port=_port,
         proxy_headers=True,
     )
-
