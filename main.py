@@ -182,9 +182,11 @@ app.include_router(youtube_legacy_router)
 app.include_router(downloader_legacy_router)
 
 from routers.dashboard_api import public_router as public_projects_router
+from routers.dashboard_api import contents_public_router
 from routers.dashboard_api import router as dashboard_router
 app.include_router(dashboard_router)
 app.include_router(public_projects_router)
+app.include_router(contents_public_router)
 
 
 # ──────────────────────────────────────────────

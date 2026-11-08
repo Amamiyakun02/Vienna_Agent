@@ -604,6 +604,179 @@ async def activate_user(
     return store.user_to_dict(store.update_user(db, u, {"status": "active"}))
 
 
+# ── Modul 4: Contents (spec §6; diskusi skema 8 Nov 2026) ──
+# Admin: CRUD penuh bergerbang token. Publik: router terpisah tanpa
+# token yang HANYA menyajikan konten published (draft tidak bocor —
+# slug draft menjawab 404 di sisi publik).
+
+_SLUG_RE = _re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class ContentIn(BaseModel):
+    type: Literal["project", "blog", "paper", "research"] = "blog"
+    title: str
+    slug: str | None = None
+    summary: str | None = None
+    body: str | None = None
+    tags: list = []
+    thumbnail: str | None = None
+    status: Literal["draft", "published"] = "draft"
+
+
+def _slugify(title: str) -> str:
+    s = _re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return s[:200] or "konten"
+
+
+def _unique_slug(db: Session, base: str, exclude_id: int | None = None) -> str:
+    slug = base
+    n = 2
+    while True:
+        found = store.find_content_by_slug(db, slug)
+        if found is None or (exclude_id is not None and found.id == exclude_id):
+            return slug
+        slug = f"{base[:205]}-{n}"
+        n += 1
+
+
+def _content_or_404(db: Session, content_id: int):
+    c = store.get_content(db, content_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan.")
+    return c
+
+
+def _validate_content(payload: ContentIn, db: Session, exclude_id: int | None = None) -> dict:
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Judul wajib diisi.")
+    if len(title) > 200:
+        raise HTTPException(status_code=422, detail="Judul maksimal 200 karakter.")
+    slug_in = (payload.slug or "").strip().lower()
+    if slug_in:
+        if len(slug_in) > 220 or not _SLUG_RE.match(slug_in):
+            raise HTTPException(
+                status_code=422,
+                detail="Slug tidak valid (huruf kecil/angka/strip, tanpa spasi).",
+            )
+        clash = store.find_content_by_slug(db, slug_in)
+        if clash is not None and clash.id != exclude_id:
+            raise HTTPException(
+                status_code=409, detail="Slug sudah dipakai konten lain."
+            )
+        slug = slug_in
+    else:
+        slug = _unique_slug(db, _slugify(title), exclude_id=exclude_id)
+    tags = []
+    for t in payload.tags or []:
+        ts = str(t).strip()
+        if ts:
+            tags.append(ts[:50])
+    if len(tags) > 20:
+        raise HTTPException(status_code=422, detail="Maksimal 20 tag.")
+    thumb = (payload.thumbnail or "").strip() or None
+    if thumb and not (
+        thumb.startswith("http://")
+        or thumb.startswith("https://")
+        or thumb.startswith("/")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Thumbnail harus URL http(s) atau path diawali /.",
+        )
+    return {
+        "type": payload.type,
+        "title": title,
+        "slug": slug,
+        "summary": (payload.summary or "").strip() or None,
+        "body": payload.body,
+        "tags": tags,
+        "thumbnail": thumb,
+        "status": payload.status,
+    }
+
+
+@router.get("/contents")
+async def list_contents(
+    type: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_contents(db, type=type, status=status, q=q)
+    return {"items": [store.content_to_dict(c) for c in rows], "total": len(rows)}
+
+
+@router.post("/contents", status_code=201)
+async def create_content(
+    payload: ContentIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    data = _validate_content(payload, db)
+    c = store.create_content(db, data)
+    return store.content_to_dict(c)
+
+
+@router.get("/contents/{content_id}")
+async def get_content(
+    content_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    return store.content_to_dict(_content_or_404(db, content_id))
+
+
+@router.put("/contents/{content_id}")
+async def update_content(
+    content_id: int,
+    payload: ContentIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    c = _content_or_404(db, content_id)
+    data = _validate_content(payload, db, exclude_id=c.id)
+    return store.content_to_dict(store.update_content(db, c, data))
+
+
+@router.delete("/contents/{content_id}")
+async def delete_content(
+    content_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    c = _content_or_404(db, content_id)
+    store.soft_delete_content(db, c)
+    return {"ok": True, "deleted_id": content_id}
+
+
+contents_public_router = APIRouter(prefix="/v1/contents", tags=["public-contents"])
+
+
+@contents_public_router.get("")
+def public_contents(
+    type: str | None = None,
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_published_contents(db, type=type)
+    return {
+        "items": [store.content_to_public_dict(c) for c in rows],
+        "total": len(rows),
+    }
+
+
+@contents_public_router.get("/{slug}")
+def public_content_by_slug(
+    slug: str,
+    db: Session = Depends(store.dashboard_session),
+):
+    c = store.get_published_content_by_slug(db, slug)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan.")
+    return store.content_to_public_dict(c)
+
+
 # ── Modul 2: System Log + pantau sistem (spec §4) ───────────
 # vault   : parse ~/agent_knowledge/_log.md per entri (read-only).
 # backend : tail log backend (~/vienna-backend.log) per baris.

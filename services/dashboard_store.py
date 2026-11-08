@@ -605,3 +605,143 @@ def verify_user_credentials(db, project: str, username: str, password: str) -> b
     if u is None or u.status != "active":
         return False
     return verify_password(password, u.password_hash)
+
+
+# ── Modul 4: Contents (spec §6; diskusi skema 8 Nov 2026) ──
+# Artikel markdown untuk portofolio: type project/blog/paper/research.
+# Admin mengelola semua status; publik HANYA membaca yang published
+# (endpoint publik di router terpisah, tanpa token). Slug unik di
+# antara baris yang tidak terhapus — dijaga level aplikasi (-> 409).
+
+
+class Content(Base):
+    __tablename__ = "contents"
+
+    id = Column(Integer, primary_key=True)
+    type = Column(String(20), nullable=False, default="blog")
+    title = Column(String(200), nullable=False)
+    slug = Column(String(220), nullable=False)
+    summary = Column(Text, nullable=True)
+    body = Column(Text, nullable=True)
+    tags = Column(JSON, nullable=False, default=list)
+    thumbnail = Column(String(500), nullable=True)
+    status = Column(String(20), nullable=False, default="draft")
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+CONTENT_TYPES = ("project", "blog", "paper", "research")
+CONTENT_STATUSES = ("draft", "published")
+
+
+def content_to_dict(c: Content) -> dict:
+    return {
+        "id": c.id,
+        "type": c.type,
+        "title": c.title,
+        "slug": c.slug,
+        "summary": c.summary,
+        "body": c.body,
+        "tags": c.tags or [],
+        "thumbnail": c.thumbnail,
+        "status": c.status,
+        "published_at": c.published_at.isoformat() if c.published_at else None,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+    }
+
+
+def content_to_public_dict(c: Content) -> dict:
+    return {
+        "id": c.id,
+        "type": c.type,
+        "title": c.title,
+        "slug": c.slug,
+        "summary": c.summary,
+        "body": c.body,
+        "tags": c.tags or [],
+        "thumbnail": c.thumbnail,
+        "published_at": c.published_at.isoformat() if c.published_at else None,
+        "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+    }
+
+
+def list_contents(db, type: str | None = None, status: str | None = None, q: str | None = None):
+    query = db.query(Content).filter(Content.deleted_at.is_(None))
+    if type:
+        query = query.filter(Content.type == type)
+    if status:
+        query = query.filter(Content.status == status)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (Content.title.ilike(like))
+            | (Content.summary.ilike(like))
+            | (Content.slug.ilike(like))
+        )
+    return query.order_by(Content.updated_at.desc()).all()
+
+
+def get_content(db, content_id: int):
+    return (
+        db.query(Content)
+        .filter(Content.id == content_id, Content.deleted_at.is_(None))
+        .first()
+    )
+
+
+def find_content_by_slug(db, slug: str):
+    return (
+        db.query(Content)
+        .filter(Content.slug == slug, Content.deleted_at.is_(None))
+        .first()
+    )
+
+
+def create_content(db, data: dict) -> Content:
+    c = Content(**data)
+    if c.status == "published" and c.published_at is None:
+        c.published_at = _now()
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return c
+
+
+def update_content(db, c: Content, data: dict) -> Content:
+    was_published = c.status == "published"
+    for key, value in data.items():
+        setattr(c, key, value)
+    if c.status == "published" and not was_published and c.published_at is None:
+        c.published_at = _now()
+    db.commit()
+    db.refresh(c)
+    return c
+
+
+def soft_delete_content(db, c: Content) -> None:
+    c.deleted_at = _now()
+    db.commit()
+
+
+def list_published_contents(db, type: str | None = None):
+    query = db.query(Content).filter(
+        Content.deleted_at.is_(None), Content.status == "published"
+    )
+    if type:
+        query = query.filter(Content.type == type)
+    return query.order_by(Content.published_at.desc()).all()
+
+
+def get_published_content_by_slug(db, slug: str):
+    return (
+        db.query(Content)
+        .filter(
+            Content.slug == slug,
+            Content.status == "published",
+            Content.deleted_at.is_(None),
+        )
+        .first()
+    )
