@@ -428,6 +428,182 @@ async def test_integration(
         }
 
 
+# ── Modul 5: Users (spec §7; diskusi skema 8 Nov 2026) ──
+# Password datang sebagai plaintext HANYA di badan request HTTPS lokal
+# ini, langsung di-hash bcrypt di store, tidak pernah dilog dan tidak
+# pernah dikembalikan. Reset password = endpoint terpisah.
+
+_PROJECT_RE = _re.compile(r"^[a-z0-9][a-z0-9-]{1,60}$")
+_USERNAME_RE = _re.compile(r"^[A-Za-z0-9_.-]{3,50}$")
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class UserCreateIn(BaseModel):
+    project: str
+    username: str
+    email: str
+    password: str
+    role: Literal["admin", "user"] = "user"
+    status: Literal["active", "suspended"] = "active"
+
+
+class UserUpdateIn(BaseModel):
+    project: str
+    username: str
+    email: str
+    role: Literal["admin", "user"] = "user"
+    status: Literal["active", "suspended"] = "active"
+
+
+class ResetPasswordIn(BaseModel):
+    password: str
+
+
+def _validate_user_fields(project: str, username: str, email: str) -> dict:
+    project = project.strip().lower()
+    username = username.strip()
+    email = email.strip()
+    if not _PROJECT_RE.match(project):
+        raise HTTPException(
+            status_code=422,
+            detail="Slug project tidak valid (huruf kecil/angka/strip, 2-61 karakter).",
+        )
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=422,
+            detail="Username tidak valid (3-50 karakter: huruf, angka, titik, strip, garis bawah).",
+        )
+    if len(email) > 200 or not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail="Format email tidak valid.")
+    return {"project": project, "username": username, "email": email}
+
+
+def _validate_password(password: str) -> None:
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=422, detail="Password minimal 8 karakter."
+        )
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=422,
+            detail="Password terlalu panjang (maks 72 byte, batas bcrypt).",
+        )
+
+
+def _user_or_404(db: Session, user_id: int):
+    u = store.get_user(db, user_id)
+    if u is None:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+    return u
+
+
+@router.get("/users")
+async def list_users(
+    project: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_users(db, project=project, status=status, q=q)
+    projects = sorted({u.project for u in store.list_users(db)})
+    return {
+        "items": [store.user_to_dict(u) for u in rows],
+        "total": len(rows),
+        "projects": projects,
+    }
+
+
+@router.post("/users", status_code=201)
+async def create_user(
+    payload: UserCreateIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    fields = _validate_user_fields(payload.project, payload.username, payload.email)
+    _validate_password(payload.password)
+    if store.find_user(db, fields["project"], fields["username"]) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Username sudah dipakai di project ini.",
+        )
+    data = {**fields, "role": payload.role, "status": payload.status}
+    u = store.create_user(db, data, payload.password)
+    return store.user_to_dict(u)
+
+
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    return store.user_to_dict(_user_or_404(db, user_id))
+
+
+@router.put("/users/{user_id}")
+async def update_user(
+    user_id: int,
+    payload: UserUpdateIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    u = _user_or_404(db, user_id)
+    fields = _validate_user_fields(payload.project, payload.username, payload.email)
+    clash = store.find_user(db, fields["project"], fields["username"])
+    if clash is not None and clash.id != u.id:
+        raise HTTPException(
+            status_code=409,
+            detail="Username sudah dipakai di project ini.",
+        )
+    data = {**fields, "role": payload.role, "status": payload.status}
+    return store.user_to_dict(store.update_user(db, u, data))
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    u = _user_or_404(db, user_id)
+    store.soft_delete_user(db, u)
+    return {"ok": True, "deleted_id": user_id}
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(
+    user_id: int,
+    payload: ResetPasswordIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    u = _user_or_404(db, user_id)
+    _validate_password(payload.password)
+    store.reset_user_password(db, u, payload.password)
+    return {"ok": True, "user_id": user_id}
+
+
+@router.post("/users/{user_id}/suspend")
+async def suspend_user(
+    user_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    u = _user_or_404(db, user_id)
+    return store.user_to_dict(store.update_user(db, u, {"status": "suspended"}))
+
+
+@router.post("/users/{user_id}/activate")
+async def activate_user(
+    user_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    u = _user_or_404(db, user_id)
+    return store.user_to_dict(store.update_user(db, u, {"status": "active"}))
+
+
 # ── Modul 2: System Log + pantau sistem (spec §4) ───────────
 # vault   : parse ~/agent_knowledge/_log.md per entri (read-only).
 # backend : tail log backend (~/vienna-backend.log) per baris.

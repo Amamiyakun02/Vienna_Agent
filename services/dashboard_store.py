@@ -476,3 +476,132 @@ def record_integration_test(db, i: Integration, ok: bool) -> None:
     i.last_tested_at = _now()
     i.last_test_ok = ok
     db.commit()
+
+
+# ── Modul 5: Users (spec §7; diskusi skema 8 Nov 2026) ──
+# Registry user per project (konsumen pertama: ViennaAssistantMobile).
+# Password SELALU bcrypt — plaintext tidak pernah disimpan, hash tidak
+# pernah dikembalikan API. Auth terpusat untuk aplikasi konsumen adalah
+# pekerjaan lanjutan (catatan v1 spec); verify_user_credentials adalah
+# fondasinya.
+
+import bcrypt as _bcrypt
+
+
+class AppUser(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    project = Column(String(100), nullable=False)
+    username = Column(String(50), nullable=False)
+    email = Column(String(200), nullable=False)
+    password_hash = Column(String(200), nullable=False)
+    role = Column(String(20), nullable=False, default="user")
+    status = Column(String(20), nullable=False, default="active")
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+USER_ROLES = ("admin", "user")
+USER_STATUSES = ("active", "suspended")
+
+
+def hash_password(plain: str) -> str:
+    return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def user_to_dict(u: AppUser) -> dict:
+    """Bentuk API: TANPA password_hash — tidak pernah, dalam keadaan
+    apa pun."""
+    return {
+        "id": u.id,
+        "project": u.project,
+        "username": u.username,
+        "email": u.email,
+        "role": u.role,
+        "status": u.status,
+        "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+        "updated_at": u.updated_at.isoformat() if u.updated_at else None,
+    }
+
+
+def list_users(db, project: str | None = None, status: str | None = None, q: str | None = None):
+    query = db.query(AppUser).filter(AppUser.deleted_at.is_(None))
+    if project:
+        query = query.filter(AppUser.project == project)
+    if status:
+        query = query.filter(AppUser.status == status)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (AppUser.username.ilike(like)) | (AppUser.email.ilike(like))
+        )
+    return query.order_by(AppUser.updated_at.desc()).all()
+
+
+def get_user(db, user_id: int):
+    return (
+        db.query(AppUser)
+        .filter(AppUser.id == user_id, AppUser.deleted_at.is_(None))
+        .first()
+    )
+
+
+def find_user(db, project: str, username: str):
+    return (
+        db.query(AppUser)
+        .filter(
+            AppUser.project == project,
+            AppUser.username == username,
+            AppUser.deleted_at.is_(None),
+        )
+        .first()
+    )
+
+
+def create_user(db, data: dict, password_plain: str) -> AppUser:
+    u = AppUser(password_hash=hash_password(password_plain), **data)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def update_user(db, u: AppUser, data: dict) -> AppUser:
+    for key, value in data.items():
+        setattr(u, key, value)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def reset_user_password(db, u: AppUser, password_plain: str) -> AppUser:
+    u.password_hash = hash_password(password_plain)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def soft_delete_user(db, u: AppUser) -> None:
+    u.deleted_at = _now()
+    db.commit()
+
+
+def verify_user_credentials(db, project: str, username: str, password: str) -> bool:
+    """Fondasi auth aplikasi konsumen: True hanya bila user ada,
+    berstatus active, dan password cocok. User suspended/gagal =
+    False."""
+    u = find_user(db, project, username)
+    if u is None or u.status != "active":
+        return False
+    return verify_password(password, u.password_hash)
