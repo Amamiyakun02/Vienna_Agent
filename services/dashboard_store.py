@@ -291,6 +291,11 @@ def init_dashboard_db() -> bool:
             print(f"[DASHBOARD] Tabel projects dibuat + seed {len(_SEED)} project dari Peta Project.")
         else:
             print("[DASHBOARD] Tabel dashboard siap (projects sudah terisi).")
+        if db.query(Integration).count() == 0:
+            for row in _INTEGRATION_SEED:
+                db.add(Integration(headers={}, **row))
+            db.commit()
+            print(f"[DASHBOARD] Tabel integrations dibuat + seed {len(_INTEGRATION_SEED)} integrasi infra.")
     finally:
         db.close()
     return True
@@ -343,3 +348,131 @@ def soft_delete_project(db, p: Project) -> None:
     if was_featured:
         _renumber_featured(db)
         db.commit()
+
+
+# ── Modul 3: Integrations (spec §5; diskusi skema 8 Nov 2026) ──
+# v1: kredensial HANYA referensi env var (auth_env_var = NAMA variabel;
+# nilai dibaca backend dari environment saat test koneksi, tidak pernah
+# disimpan di DB dan tidak pernah dikembalikan API). Kolom secret
+# terenkripsi Fernet DITUNDA sesuai keputusan diskusi 8 Nov 2026.
+
+
+class Integration(Base):
+    __tablename__ = "integrations"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    kind = Column(String(20), nullable=False, default="rest")
+    base_url = Column(String(500), nullable=False)
+    auth_type = Column(String(20), nullable=False, default="none")
+    auth_env_var = Column(String(200), nullable=True)
+    headers = Column(JSON, nullable=False, default=dict)
+    notes = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="active")
+    last_tested_at = Column(DateTime(timezone=True), nullable=True)
+    last_test_ok = Column(Boolean, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+INTEGRATION_KINDS = ("rest", "webhook", "mcp", "other")
+INTEGRATION_AUTH_TYPES = ("none", "api_key", "bearer", "basic", "oauth")
+INTEGRATION_STATUSES = ("active", "inactive")
+
+# Seed awal: layanan infra milik user sendiri (dari Peta Project) —
+# hanya saat tabel kosong.
+_INTEGRATION_SEED = [
+    {
+        "name": "Vienna Agent (backend ini)",
+        "kind": "rest",
+        "base_url": "http://127.0.0.1:8000/",
+        "auth_type": "none",
+        "notes": "Health check backend utama.",
+    },
+    {
+        "name": "MCPServer lokal",
+        "kind": "mcp",
+        "base_url": "http://127.0.0.1:8001/",
+        "auth_type": "none",
+        "notes": "Container agentmcp-server di laptop.",
+    },
+    {
+        "name": "Qdrant lokal",
+        "kind": "rest",
+        "base_url": "http://127.0.0.1:6333/",
+        "auth_type": "none",
+        "notes": "Container qdrant_server di laptop (vector DB RAG).",
+    },
+]
+
+
+def integration_to_dict(i: Integration) -> dict:
+    """Bentuk API: TANPA nilai secret apa pun — hanya nama env var dan
+    status keberadaannya di environment backend (boolean)."""
+    env_name = i.auth_env_var or None
+    return {
+        "id": i.id,
+        "name": i.name,
+        "kind": i.kind,
+        "base_url": i.base_url,
+        "auth_type": i.auth_type,
+        "auth_env_var": env_name,
+        "auth_env_present": bool(env_name and os.getenv(env_name)),
+        "headers": i.headers or {},
+        "notes": i.notes,
+        "status": i.status,
+        "last_tested_at": i.last_tested_at.isoformat() if i.last_tested_at else None,
+        "last_test_ok": i.last_test_ok,
+        "created_at": i.created_at.isoformat() if i.created_at else None,
+        "updated_at": i.updated_at.isoformat() if i.updated_at else None,
+    }
+
+
+def list_integrations(db, status: str | None = None, q: str | None = None):
+    query = db.query(Integration).filter(Integration.deleted_at.is_(None))
+    if status:
+        query = query.filter(Integration.status == status)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (Integration.name.ilike(like))
+            | (Integration.base_url.ilike(like))
+            | (Integration.notes.ilike(like))
+        )
+    return query.order_by(Integration.updated_at.desc()).all()
+
+
+def get_integration(db, integration_id: int):
+    return (
+        db.query(Integration)
+        .filter(Integration.id == integration_id, Integration.deleted_at.is_(None))
+        .first()
+    )
+
+
+def create_integration(db, data: dict) -> Integration:
+    i = Integration(**data)
+    db.add(i)
+    db.commit()
+    db.refresh(i)
+    return i
+
+
+def update_integration(db, i: Integration, data: dict) -> Integration:
+    for key, value in data.items():
+        setattr(i, key, value)
+    db.commit()
+    db.refresh(i)
+    return i
+
+
+def soft_delete_integration(db, i: Integration) -> None:
+    i.deleted_at = _now()
+    db.commit()
+
+
+def record_integration_test(db, i: Integration, ok: bool) -> None:
+    i.last_tested_at = _now()
+    i.last_test_ok = ok
+    db.commit()

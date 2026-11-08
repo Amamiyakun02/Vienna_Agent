@@ -236,6 +236,198 @@ def public_list(db: Session = Depends(store.dashboard_session)):
     }
 
 
+# ── Modul 3: Integrations (spec §5; diskusi skema 8 Nov 2026) ─
+# v1: kredensial HANYA referensi env var — nilai secret dibaca backend
+# dari environment saat test koneksi; tidak disimpan di DB, tidak pernah
+# dikembalikan API (hanya boolean keberadaannya). Header kustom yang
+# namanya sensitif (authorization/api-key/token) ditampilkan ter-mask
+# dan nilai "***" saat PUT berarti "pertahankan nilai lama".
+
+import re as _re
+from urllib.parse import urlparse as _urlparse
+
+import httpx as _httpx
+
+_SENSITIVE_HEADERS = {"authorization", "x-api-key", "api-key", "x-auth-token", "token"}
+_ENV_NAME_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class IntegrationIn(BaseModel):
+    name: str
+    kind: Literal["rest", "webhook", "mcp", "other"] = "rest"
+    base_url: str
+    auth_type: Literal["none", "api_key", "bearer", "basic", "oauth"] = "none"
+    auth_env_var: str | None = None
+    headers: dict = {}
+    notes: str | None = None
+    status: Literal["active", "inactive"] = "active"
+
+
+def _integration_or_404(db: Session, integration_id: int):
+    i = store.get_integration(db, integration_id)
+    if i is None:
+        raise HTTPException(status_code=404, detail="Integrasi tidak ditemukan.")
+    return i
+
+
+def _validate_integration(payload: IntegrationIn) -> dict:
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="Nama integrasi wajib diisi.")
+    parsed = _urlparse(payload.base_url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail="base_url harus URL http(s) yang valid (cegah SSRF, spec §9).",
+        )
+    env_name = (payload.auth_env_var or "").strip() or None
+    if env_name and not _ENV_NAME_RE.match(env_name):
+        raise HTTPException(
+            status_code=422,
+            detail="auth_env_var harus nama variabel environment yang valid (huruf/angka/garis bawah).",
+        )
+    headers = {}
+    for k, v in (payload.headers or {}).items():
+        key = str(k).strip()
+        if key:
+            headers[key] = str(v)
+    data = payload.model_dump()
+    data["name"] = payload.name.strip()
+    data["base_url"] = payload.base_url.strip()
+    data["auth_env_var"] = env_name
+    data["headers"] = headers
+    return data
+
+
+def _mask_headers(headers: dict) -> dict:
+    return {
+        k: ("***" if k.lower() in _SENSITIVE_HEADERS and v else v)
+        for k, v in (headers or {}).items()
+    }
+
+
+def _integration_out(i) -> dict:
+    d = store.integration_to_dict(i)
+    d["headers"] = _mask_headers(d.get("headers") or {})
+    return d
+
+
+@router.get("/integrations")
+async def list_integrations(
+    status: str | None = None,
+    q: str | None = None,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_integrations(db, status=status, q=q)
+    return {"items": [_integration_out(i) for i in rows], "total": len(rows)}
+
+
+@router.post("/integrations", status_code=201)
+async def create_integration(
+    payload: IntegrationIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    data = _validate_integration(payload)
+    i = store.create_integration(db, data)
+    return _integration_out(i)
+
+
+@router.get("/integrations/{integration_id}")
+async def get_integration(
+    integration_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    return _integration_out(_integration_or_404(db, integration_id))
+
+
+@router.put("/integrations/{integration_id}")
+async def update_integration(
+    integration_id: int,
+    payload: IntegrationIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    i = _integration_or_404(db, integration_id)
+    data = _validate_integration(payload)
+    # Nilai "***" pada header sensitif = pertahankan nilai tersimpan.
+    old_headers = i.headers or {}
+    for k, v in list(data["headers"].items()):
+        if v == "***" and k.lower() in _SENSITIVE_HEADERS and k in old_headers:
+            data["headers"][k] = old_headers[k]
+    return _integration_out(store.update_integration(db, i, data))
+
+
+@router.delete("/integrations/{integration_id}")
+async def delete_integration(
+    integration_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    i = _integration_or_404(db, integration_id)
+    store.soft_delete_integration(db, i)
+    return {"ok": True, "deleted_id": integration_id}
+
+
+def _resolve_auth_headers(i):
+    """Header auth dari env var. Nilai secret hanya hidup di dict ini
+    selama request test — tidak dilog, tidak masuk respons."""
+    headers = dict(i.headers or {})
+    if i.auth_type == "none":
+        return headers, None
+    if not i.auth_env_var:
+        return headers, f"auth_type '{i.auth_type}' butuh auth_env_var, tapi kolomnya kosong."
+    value = os.getenv(i.auth_env_var)
+    if not value:
+        return headers, f"Env var {i.auth_env_var} tidak terisi di environment backend."
+    if i.auth_type == "api_key":
+        headers.setdefault("X-API-Key", value)
+    elif i.auth_type in ("bearer", "oauth"):
+        headers.setdefault("Authorization", f"Bearer {value}")
+    elif i.auth_type == "basic":
+        headers.setdefault(
+            "Authorization",
+            "Basic " + base64.b64encode(value.encode()).decode(),
+        )
+    return headers, None
+
+
+@router.post("/integrations/{integration_id}/test")
+async def test_integration(
+    integration_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    i = _integration_or_404(db, integration_id)
+    headers, err = _resolve_auth_headers(i)
+    if err:
+        store.record_integration_test(db, i, False)
+        return {"ok": False, "error": err, "latency_ms": None}
+    start = time.perf_counter()
+    try:
+        async with _httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(i.base_url, headers=headers)
+        latency = int((time.perf_counter() - start) * 1000)
+        ok = resp.status_code < 400
+        store.record_integration_test(db, i, ok)
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "latency_ms": latency,
+            "error": None if ok else f"Server menjawab HTTP {resp.status_code}.",
+        }
+    except Exception as e:  # koneksi gagal/timeout/dll — pesan wajib ter-mask
+        latency = int((time.perf_counter() - start) * 1000)
+        store.record_integration_test(db, i, False)
+        return {
+            "ok": False,
+            "status_code": None,
+            "latency_ms": latency,
+            "error": _mask_secrets(str(e))[:200] or "Koneksi gagal.",
+        }
+
+
 # ── Modul 2: System Log + pantau sistem (spec §4) ───────────
 # vault   : parse ~/agent_knowledge/_log.md per entri (read-only).
 # backend : tail log backend (~/vienna-backend.log) per baris.
