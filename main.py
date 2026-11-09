@@ -450,7 +450,7 @@ _JAILBREAK_PATTERNS = [
     r"tulis\s+ulang\s+(instruksi|system)",
     r"reveal\s+(your\s+)?(system\s*prompt|instructions|internal)",
     r"repeat\s+(your\s+)?(system\s*prompt|instructions)",
-    r"jailbreak|jail\s*break|\bDAN\b",
+    r"jailbreak|jail\s*break",
     r"kamu\s+sekarang\s+(adalah|bukan)|anda\s+sekarang\s+(adalah|bukan)",
     r"you\s+are\s+now\s+(a|an|not|no\s+longer|dan|without|above|beyond|unrestricted|jailbroken|free)",
     r"developer\s*mode|mode\s*developer|god\s*mode|mode\s*dewa",
@@ -462,11 +462,24 @@ _JAILBREAK_PATTERNS = [
 
 _compiled_jailbreak = [re.compile(p, re.IGNORECASE) for p in _JAILBREAK_PATTERNS]
 
+# Pola PEKA huruf besar/kecil — dicek terpisah TANPA IGNORECASE.
+# "DAN" (Do Anything Now) selalu ditulis serba kapital oleh penyerang,
+# sedangkan "dan" adalah kata sambung Bahasa Indonesia yang sangat umum:
+# mencocokkan \bDAN\b secara case-insensitive memblokir hampir semua
+# kalimat Indonesia (false positive massal, diperbaiki 9 Nov 2026).
+_JAILBREAK_PATTERNS_CS = [
+    r"\bDAN\b",
+]
+
+_compiled_jailbreak_cs = [re.compile(p) for p in _JAILBREAK_PATTERNS_CS]
+
 
 def detect_jailbreak(text: str) -> bool:
     """True bila input cocok pola injeksi/jailbreak umum."""
     t = text or ""
-    return any(rx.search(t) for rx in _compiled_jailbreak)
+    return any(rx.search(t) for rx in _compiled_jailbreak) or any(
+        rx.search(t) for rx in _compiled_jailbreak_cs
+    )
 
 
 def _jailbreak_refusal(lang: Optional[str]) -> str:
