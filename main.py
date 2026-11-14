@@ -188,6 +188,9 @@ app.include_router(dashboard_router)
 app.include_router(public_projects_router)
 app.include_router(contents_public_router)
 
+from routers.opencode_api import router as opencode_router
+app.include_router(opencode_router)
+
 
 # ──────────────────────────────────────────────
 # GLOBAL EXCEPTION HANDLERS (Manual CORS headers injection)
@@ -655,6 +658,14 @@ async def list_engines():
                 "model": getattr(agent_deepseek, "model_name", "deepseek-v4.1-flash"),
                 "endpoint": "/v1/deepseek/chat",
                 "available": bool(getattr(agent_deepseek, "available", False)),
+            },
+            {
+                "id": "opencode",
+                "label": "OpenCode Agent (core harness)",
+                "provider": "opencode-serve",
+                "model": os.getenv("OPENCODE_MODEL", "deepseek-v4.1-flash-free"),
+                "endpoint": "/v1/opencode/chat",
+                "available": bool(os.getenv("OPENCODE_SERVER_PASSWORD")),
             },
         ],
     }
