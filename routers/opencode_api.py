@@ -32,6 +32,7 @@ router = APIRouter(prefix="/v1/opencode", tags=["OpenCode Agent"])
 BASE_URL = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096").rstrip("/")
 PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 DEFAULT_AGENT = os.getenv("OPENCODE_AGENT", "vienna")
+DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "").strip()  # format "providerID/modelID"
 TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
@@ -79,7 +80,7 @@ async def _create_session(body: SessionIn) -> str:
     payload: dict = {"agent": body.agent or DEFAULT_AGENT}
     if body.title:
         payload["title"] = body.title
-    ref = _model_ref(body.model)
+    ref = _model_ref(body.model or DEFAULT_MODEL)
     if ref:
         payload["model"] = ref
     data = await _oc("POST", "/api/session", json=payload)
@@ -100,6 +101,27 @@ async def status():
         "default_agent": DEFAULT_AGENT,
         "default_model": model.get("id"),
         "auth_configured": bool(PASSWORD),
+    }
+
+
+@router.get("/models")
+async def list_models():
+    """Katalog model opencode serve, dikelompokkan per provider.
+
+    API key platform lain diisi user di .env backend (nama env standar
+    tiap provider) dan diteruskan ke serve oleh start-opencode-serve.sh;
+    model provider itu otomatis bisa dipilih lewat field "model"
+    ("providerID/modelID") pada POST /chat atau env OPENCODE_MODEL.
+    """
+    data = await _oc("GET", "/api/model")
+    providers: dict[str, list[str]] = {}
+    for m in (data or {}).get("data", []):
+        providers.setdefault(m.get("providerID", "?"), []).append(m.get("id"))
+    return {
+        "status": "success",
+        "total": sum(len(v) for v in providers.values()),
+        "default_model": DEFAULT_MODEL or None,
+        "providers": {k: sorted(v) for k, v in sorted(providers.items())},
     }
 
 
