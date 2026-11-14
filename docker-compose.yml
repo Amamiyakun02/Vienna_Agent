@@ -1,0 +1,149 @@
+# Docker Compose — tumpukan backend Vienna (satu VPS)
+# Spec: vault "AI Dev Company Infrastructure" (postgres/redis/qdrant
+# persisten) + keputusan arsitektur VPS 13 Nov 2026 (batas RAM per
+# container; hanya backend yang dipetakan ke host itupun localhost;
+# PostgreSQL/Qdrant/MCP/Redis jaringan internal saja; MongoDB TETAP
+# cloud Atlas sesuai desain dashboard — sengaja bukan container).
+#
+# Tata letak WAJIB: folder Vienna_Agent dan MCPServer bersebelahan
+# (di laptop ~/Desktop/, di VPS mis. ~/apps/), karena service mcp
+# di-build dari ../MCPServer dengan Dockerfile-nya sendiri.
+#
+# Kredensial: semua dari .env folder ini (chmod 600, JANGAN di-commit).
+# POSTGRES_USER/POSTGRES_DB/POSTGRES_PASSWORD dipakai bersama oleh
+# container postgres dan DATABASE_URL backend — satu sumber, selalu sinkron.
+#
+# Jalankan:  docker compose up -d --build
+# Cek:       docker compose ps && curl http://127.0.0.1:8000/health
+#
+# opencode serve TIDAK di-container-kan di v1 ini: ia tetap jalan di
+# host VPS; backend menjangkaunya lewat host.docker.internal:4096.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vienna-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8000"
+      # Override alamat antar-container (nilai localhost di .env hanya
+      # untuk jalan bare-metal di laptop).
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-vienna}:${POSTGRES_PASSWORD:?isi POSTGRES_PASSWORD di .env}@postgres:5432/${POSTGRES_DB:-vienna_dashboard}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MCP_URL: http://mcp:8001/mcp
+      OPENCODE_BASE_URL: http://host.docker.internal:4096
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Hanya localhost VPS — akses publik nanti via reverse proxy
+      # (api.amamiya.web.id), bukan dengan membuka port ini.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      mcp:
+        condition: service_started
+    mem_limit: 2g
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mcp:
+    build:
+      context: ../MCPServer
+      dockerfile: Dockerfile
+    image: agentmcp-server:local
+    container_name: vienna-mcp
+    restart: unless-stopped
+    env_file:
+      - path: ../MCPServer/.env
+        required: false
+    environment:
+      SSE_PORT: "8001"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ""
+    # Tanpa ports: hanya backend yang memanggil http://mcp:8001/mcp
+    expose:
+      - "8001"
+    depends_on:
+      qdrant:
+        condition: service_started
+    mem_limit: 1g
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: vienna-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vienna}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?isi POSTGRES_PASSWORD di .env}
+      POSTGRES_DB: ${POSTGRES_DB:-vienna_dashboard}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Tanpa ports: hanya backend lewat jaringan internal.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vienna} -d ${POSTGRES_DB:-vienna_dashboard}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: vienna-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    # Tanpa ports: hanya backend & mcp lewat jaringan internal.
+    expose:
+      - "6333"
+      - "6334"
+    mem_limit: 1g
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: vienna-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    # Tanpa ports: hanya backend lewat jaringan internal.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  qdrant_storage:
+  redis_data:
