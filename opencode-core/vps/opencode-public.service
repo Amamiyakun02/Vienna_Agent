@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenCode Serve - Public Agent (portofolio)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=amamiya
+WorkingDirectory=/home/amamiya/apps/agent-public
+EnvironmentFile=/home/amamiya/apps/Vienna_Agent/.env
+Environment=XDG_DATA_HOME=/home/amamiya/apps/agent-public/.data
+ExecStart=/home/amamiya/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4097
+Restart=on-failure
+RestartSec=5
+# Pengerasan murah pengganti container untuk instance publik:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/amamiya/apps/agent-public
+
+[Install]
+WantedBy=multi-user.target

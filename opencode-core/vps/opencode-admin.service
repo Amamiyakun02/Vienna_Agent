@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenCode Serve - Admin Agent (Vienna_Agent)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=amamiya
+WorkingDirectory=/home/amamiya/apps/Vienna_Agent
+EnvironmentFile=/home/amamiya/apps/Vienna_Agent/.env
+ExecStart=/home/amamiya/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -91,7 +91,11 @@ def _get_gemini_client():
 
 
 def gemini_embedding(text: str, model_name: str = "") -> list[float]:
-    """Embedding via Gemini (768-dim, text-embedding-004 default).
+    """Embedding via Gemini, selalu EMBEDDING_DIM (768) dimensi.
+
+    Model dari env GEMINI_EMBEDDING_MODEL; model Gemini baru berdimensi
+    asli 3072, jadi output diminta 768 via output_dimensionality lalu
+    dinormalisasi — koleksi Qdrant Vienna Agent berdimensi 768.
 
     Gagal cepat + cooldown seperti versi OpenAI: bila limit/error,
     return [] agar chat lanjut tanpa konteks (degradasi aman).
@@ -103,12 +107,22 @@ def gemini_embedding(text: str, model_name: str = "") -> list[float]:
     if client is None:
         return []
     try:
+        from google.genai import types
+
         result = client.models.embed_content(
             model=model_name or GEMINI_EMBEDDING_MODEL,
             contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
         )
         _gemini_dead_until = 0.0  # pulih — reset cooldown
-        return list(result.embeddings[0].values)
+        values = list(result.embeddings[0].values)
+        # Output dipangkas ke EMBEDDING_DIM (768) agar cocok dengan koleksi
+        # Qdrant; sesuai anjuran Google, vektor hasil pemangkasan dimensi
+        # dinormalisasi ulang (L2) agar cosine similarity tetap benar.
+        norm = sum(v * v for v in values) ** 0.5
+        if norm > 0:
+            values = [v / norm for v in values]
+        return values
     except Exception as e:
         _gemini_dead_until = time.monotonic() + GEMINI_EMB_COOLDOWN_S
         print(f"[ERROR] Error saat membuat embedding Gemini: {e}")

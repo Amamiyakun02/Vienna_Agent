@@ -1,0 +1,114 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // ============================================================
+  // INSTANCE PUBLIK — pengunjung portofolio (agent anonim)
+  // Jalankan serve dari folder INI (workspace kosong/sandbox),
+  // BUKAN dari folder Vienna_Agent. Lihat ../README.md.
+  // Format V2 (serve di server v2.1.4, di laptop v2.2.2):
+  // "agents" jamak, "mcp.servers", "permissions" berupa array.
+  // Jangan pakai format V1 (agent/mcp langsung) — tidak terbaca.
+  // ============================================================
+
+  "model": "inception/mercury-3",
+  "default_agent": "public",
+
+  // --- Provider custom: Mercury & Lyber dua-duanya OpenAI-compatible,
+  // jadi TIDAK perlu engine sendiri. Daftarkan sekali di sini,
+  // key diambil dari env (file ini aman di-commit, key TIDAK di sini).
+  "providers": {
+    "inception": {
+      "name": "Inception Labs (Mercury)",
+      "env": ["MERCURY_API_KEY", "INCEPTION_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://api.inceptionlabs.ai/v1" },
+      "models": {
+        "mercury-3": {
+          "name": "Mercury 3",
+          // WAJIB diisi untuk provider custom: tanpa limit, opencode
+          // tidak tahu kapan harus compaction. Angka context di bawah
+          // PLACEHOLDER — verifikasi ke docs Inception sebelum live.
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
+    },
+    "lyber": {
+      "name": "Lyber",
+      "env": ["LYBER_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://api.lyber.ai/v1" },
+      "models": {
+        "kimi-k31-pro-abliterated": {
+          "name": "Kimi K3.1 Pro Abliterated (Lyber)",
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
+    }
+  },
+
+  // --- Memory lapis 2 (statis): file instruksi ini dimuat ke SETIAP
+  // sesi baru. Isinya profil Amamiya + protokol memory. Edit file-nya,
+  // bukan kode backend, untuk mengubah "ingatan permanen" agent.
+  "instructions": [".opencode/instructions/*.md"],
+
+  // --- Memory lapis 1 (sesi): compaction bawaan opencode.
+  // Riwayat sesi sendiri disimpan opencode di SQLite-nya
+  // (~/.local/share/opencode/opencode.db, atau XDG_DATA_HOME bila
+  // dipisah per instance — lihat start-public.sh). Backend hanya
+  // menyimpan session_id, TIDAK menyimpan ulang riwayat chat.
+  "compaction": {
+    "auto": true,
+    "keep": { "tokens": 12000 },
+    "buffer": "15%"
+  },
+
+  // Potong output tool raksasa sebelum masuk konteks = hemat memory.
+  "tool_output": { "max_lines": 1000, "max_bytes": 30000 },
+
+  // --- Tools: SEMUA tool eksternal dari MCP server milikmu sendiri.
+  // Tambah/hapus tool = ubah MCP server / blok ini, bukan kode agent.
+  "mcp": {
+    "timeout": { "startup": 30000, "catalog": 30000, "execution": 120000 },
+    "servers": {
+      "vienna": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8001/mcp",
+        "oauth": false,
+        // PENTING untuk agent publik: false = tool tampil langsung
+        // satu-satu. Default V2 (true) membungkus tool MCP ke dalam
+        // tool "execute" (eksekusi kode) — itu melanggar aturanmu
+        // bahwa agent anonim tidak boleh mengeksekusi program.
+        "codemode": false
+        // Alternatif lokal (MCP tidak di-docker, jalan stdio):
+        // "type": "local",
+        // "command": ["uv", "run", "python", "mcp_server.py"],
+        // "cwd": "../MCPServer"
+      }
+    }
+  },
+
+  "agents": {
+    "public": {
+      "description": "Agent anonim untuk pengunjung portofolio Amamiya",
+      "mode": "primary",
+      "model": "inception/mercury-3",
+      "steps": 12,
+      "system": "Kamu adalah Vienna, asisten di portofolio Amamiya (AI Application & Automation Engineer). Jawab soal Amamiya, proyek, dan keahliannya dari file instruksi. Boleh memakai tool MCP 'vienna' dan membuat file program sebagai ISI jawaban / file di folder output/. DILARANG menjalankan program apa pun. Ikuti protokol memory di instruksi: cari dulu ke memory sebelum menjawab pertanyaan faktual tentang pengunjung yang kembali, simpan fakta baru yang awet lewat tool memory bila tersedia.",
+      // ATURAN HEADLESS: jangan pernah pakai effect "ask" di serve
+      // yang dipanggil backend — tidak ada manusia di ujung serve,
+      // request akan menggantung sampai timeout. Hanya allow/deny.
+      // Urutan penting: aturan TERAKHIR yang cocok yang menang.
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "external_directory", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "output/**", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "vienna_*", "resource": "*", "effect": "allow" }
+      ]
+    }
+  }
+}

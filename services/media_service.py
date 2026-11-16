@@ -277,6 +277,7 @@ def cache_filename(platform: Platform, media_id: str, fmt: str, quality: str) ->
 
 def cookiefile_for(platform: Platform) -> str | None:
     """Path cookie file bila ada (per platform, lalu generik). None bila tak ada."""
+    _materialize_env_cookies()
     candidates = [COOKIES_DIR / f"{platform}.txt", COOKIES_DIR / "cookies.txt"]
     for cand in candidates:
         try:
@@ -428,8 +429,18 @@ def _map_ytdlp_error(exc: Exception, platform: Platform, media_id: str) -> Media
 def _extract_info_sync(url: str, platform: Platform) -> dict[str, Any]:
     from yt_dlp import YoutubeDL
 
-    with YoutubeDL(_base_ydl_opts(platform)) as ydl:
-        return ydl.extract_info(url, download=False) or {}
+    opts = _base_ydl_opts(platform)
+    try:
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
+    except Exception:
+        if not opts.get("cookiefile"):
+            raise
+        # Cookies basi bisa MENGGAGALKAN ekstraksi konten publik (mis.
+        # "The page needs to be reloaded") — coba ulang anonim tanpa cookies.
+        opts["cookiefile"] = None
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
 
 
 def _fmt_duration(sec: int) -> str:
@@ -498,10 +509,26 @@ def _download_sync(url: str, platform: Platform, fmt: MediaFormat, quality: str,
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ]
 
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            raise DownloadFailedError("yt-dlp tidak mengembalikan info unduhan.")
+    def _attempt(dl_opts: dict[str, Any]):
+        with YoutubeDL(dl_opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    try:
+        info = _attempt(opts)
+    except Exception:
+        if not opts.get("cookiefile"):
+            raise
+        # Sama seperti ekstraksi info: cookies basi menggagalkan unduhan
+        # konten publik — bersihkan sisa berkas lalu coba ulang anonim.
+        for suffix in (".part", ".ytdl", ".temp"):
+            try:
+                Path(str(dest) + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+        opts["cookiefile"] = None
+        info = _attempt(opts)
+    if info is None:
+        raise DownloadFailedError("yt-dlp tidak mengembalikan info unduhan.")
 
     if dest.is_file():
         return dest

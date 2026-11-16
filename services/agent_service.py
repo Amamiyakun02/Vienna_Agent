@@ -282,6 +282,8 @@ DEVICE_TOOLS = [
 DEVICE_TOOL_NAMES = {"open_app", "list_files", "read_file", "get_latest_photo", "click_text", "input_text", "list_installed_apps", "read_screen", "spotify_get_current_song", "spotify_get_playlists", "spotify_get_top_artists", "spotify_get_recent_tracks", "spotify_play_music", "spotify_pause_music", "spotify_next_track", "spotify_previous_track"}
 
 async def execute_device_tool(user_id: str, tool_name: str, tool_args: dict, tool_call_id: str) -> str:
+    if not isinstance(tool_args, dict):
+        tool_args = {}
     if not user_id:
         return json.dumps({"status": "failed", "message": "Missing user_id parameter for device tool execution."})
         
@@ -648,6 +650,8 @@ def _check_sales_authorization(tool_name: str, tool_args: dict) -> tuple[bool, s
     Periksa apakah tool call diizinkan untuk role 'sales'.
     Returns: (is_authorized, error_message)
     """
+    if not isinstance(tool_args, dict):
+        tool_args = {}
     # 1. Blokir tools write yang dilarang keras
     if tool_name in _SALES_BLOCKED_TOOLS:
         return False, (
@@ -682,14 +686,20 @@ def _check_sales_authorization(tool_name: str, tool_args: dict) -> tuple[bool, s
 
 # OPENAI API
 class AgentEngine:
+    provider = "openai"
+
     def __init__(self, persona_file="agents/kurisu.json"):
-        self.gpt = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        self.available = bool(api_key)
+        self.gpt = AsyncOpenAI(api_key=api_key or "openai-key-not-set")
         with open(persona_file, "r", encoding="utf-8") as person:
             self._agent_personality = json.load(person)
 
         self._agent_instruction = build_instruction(self._agent_personality)
 
     async def chat(self, prompt: str, lang: str = "id", session_id: str = None, user_id: str = None, admin_role: str = None):
+        if not self.available:
+            raise RuntimeError("OpenAI belum dikonfigurasi: isi OPENAI_API_KEY di environment.")
         lang_instruction = (
             "IMPORTANT: You MUST respond in English. All explanations, suggestions, and conversation MUST be in English."
             if lang == "en" else
@@ -858,7 +868,7 @@ class AgentEngine:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "name": tc["name"],
+                            "name": tc["function"]["name"],
                             "content": f"Failed to connect to MCP server for execution: {conn_err}"
                         })
 
@@ -875,10 +885,484 @@ class AgentEngine:
                 except Exception as redis_err:
                     print(f"[REDIS WARN] Failed to delete session cache: {redis_err}")
 
+# ===========================================================================
+# INCEPTION LABS MERCURY
+# API OpenAI-compatible: https://api.inceptionlabs.ai/v1
+# Model chat: mercury-3 (default), mercury-2.5, mercury-2, mercury-voice.
+# Catatan provider:
+#   - temperature dibatasi 0.5–1.0 (di luar itu di-reset provider).
+#   - reasoning_effort: instant | low | medium | high.
+#   - tool calling OpenAI-compatible (parallel tool calls) di chat completions.
+#   - API key: MERCURY_API_KEY (fallback: INCEPTION_API_KEY).
+# ===========================================================================
+MERCURY_BASE_URL = os.getenv("MERCURY_BASE_URL", "https://api.inceptionlabs.ai/v1").rstrip("/")
+MERCURY_MODEL = os.getenv("MERCURY_MODEL", "mercury-3").strip() or "mercury-3"
+MERCURY_FALLBACK_MODEL = os.getenv("MERCURY_FALLBACK_MODEL", "mercury-2.5").strip()
+MERCURY_MAX_COMPLETION_TOKENS = int(os.getenv("MERCURY_MAX_COMPLETION_TOKENS", "8192"))
+MERCURY_TIMEOUT_S = float(os.getenv("MERCURY_TIMEOUT_S", "120"))
+MERCURY_MAX_STEPS = max(1, int(os.getenv("MERCURY_MAX_STEPS", "8")))
+MERCURY_STREAM_REASONING = os.getenv("MERCURY_STREAM_REASONING", "0").strip().lower() in ("1", "true", "yes")
+MERCURY_REASONING_EFFORTS = {"instant", "low", "medium", "high"}
+MERCURY_REASONING_EFFORT = os.getenv("MERCURY_REASONING_EFFORT", "low").strip().lower()
+if MERCURY_REASONING_EFFORT not in MERCURY_REASONING_EFFORTS:
+    print(f"[MERCURY WARN] reasoning_effort '{MERCURY_REASONING_EFFORT}' tidak valid; pakai 'low'.")
+    MERCURY_REASONING_EFFORT = "low"
+
+# LARP Router / DeepSeek (OpenAI-compatible)
+LARPROUTER_BASE_URL = (os.getenv("LARPROUTER_BASE_URL") or "https://larprouter.com/v1").strip().rstrip("/")
+LARPROUTER_MODEL = os.getenv("LARPROUTER_MODEL", "deepseek-v4.1-flash").strip() or "deepseek-v4.1-flash"
+LARPROUTER_FALLBACK_MODEL = os.getenv("LARPROUTER_FALLBACK_MODEL", "").strip()
+LARPROUTER_MAX_COMPLETION_TOKENS = int(os.getenv("LARPROUTER_MAX_COMPLETION_TOKENS", "8192"))
+LARPROUTER_TIMEOUT_S = float(os.getenv("LARPROUTER_TIMEOUT_S", "120"))
+LARPROUTER_MAX_STEPS = max(1, int(os.getenv("LARPROUTER_MAX_STEPS", "8")))
+
+# Lyber AI (OpenAI-compatible) — model abliterated untuk agent administrator.
+LYBER_BASE_URL = (os.getenv("LYBER_BASE_URL") or "https://api.lyber.ai/v1").strip().rstrip("/")
+LYBER_MODEL = os.getenv("LYBER_MODEL", "kimi-k31-pro-abliterated").strip() or "kimi-k31-pro-abliterated"
+LYBER_FALLBACK_MODEL = os.getenv("LYBER_FALLBACK_MODEL", "").strip()
+LYBER_MAX_COMPLETION_TOKENS = int(os.getenv("LYBER_MAX_COMPLETION_TOKENS", "8192"))
+LYBER_TIMEOUT_S = float(os.getenv("LYBER_TIMEOUT_S", "120"))
+LYBER_MAX_STEPS = max(1, int(os.getenv("LYBER_MAX_STEPS", "8")))
+
+
+def _mercury_api_key() -> str:
+    """MERCURY_API_KEY diutamakan; INCEPTION_API_KEY didukung (nama resmi SDK)."""
+    return (os.getenv("MERCURY_API_KEY") or os.getenv("INCEPTION_API_KEY") or "").strip()
+
+
+def _bounded_temperature(env_name: str, default: float, lower: float, upper: float) -> float:
+    try:
+        value = float(os.getenv(env_name, str(default)))
+    except ValueError:
+        value = default
+    return min(upper, max(lower, value))
+
+
+def _mercury_temperature() -> float:
+    return _bounded_temperature("MERCURY_TEMPERATURE", default=0.75, lower=0.5, upper=1.0)
+
+
+def _is_mercury_fallbackable(err: Exception) -> bool:
+    """True bila error layak dicoba ke model fallback (limit/overload/jaringan).
+
+    Error konfigurasi (401/403/400/422) TIDAK di-fallback — model lain tidak
+    akan menolong dan hanya menambah latency.
+    """
+    s = f"{type(err).__name__}: {err}".lower()
+    if any(k in s for k in (
+        "401", "403", "unauthorized", "invalid api key", "invalid_api_key",
+        "incorrect api key", "authentication", "permission",
+        "400", "422", "invalid_request", "bad request",
+    )):
+        return False
+    return any(k in s for k in (
+        "429", "rate limit", "rate_limit", "quota", "resource_exhausted",
+        "404", "model_not_found", "model not found", "not available",
+        "500", "502", "503", "504", "overloaded", "unavailable",
+        "internal error", "timeout", "timed out", "connection",
+        "connect", "server error",
+    ))
+
+
+class MercuryAgentEngine:
+    """Engine chat OpenAI-compatible via AsyncOpenAI (base_url custom).
+
+    Kontrak sama dengan AgentEngine/GeminiAgentEngine: `chat()` menghasilkan
+    potongan SSE `data: {"text": ...}` dan mendukung MCP + device tool calling.
+    """
+
+    provider = "mercury"
+    api_key_envs = ("MERCURY_API_KEY", "INCEPTION_API_KEY")
+    base_url = MERCURY_BASE_URL
+    primary_model = MERCURY_MODEL
+    fallback_model = MERCURY_FALLBACK_MODEL
+    max_completion_tokens = MERCURY_MAX_COMPLETION_TOKENS
+    timeout_s = MERCURY_TIMEOUT_S
+    max_steps = MERCURY_MAX_STEPS
+    stream_reasoning = MERCURY_STREAM_REASONING
+    reasoning_effort = MERCURY_REASONING_EFFORT
+    temperature_env = "MERCURY_TEMPERATURE"
+    temperature_min = 0.5
+    temperature_max = 1.0
+    temperature_default = 0.75
+    log_label = "MERCURY"
+    missing_key_message = (
+        "Mercury belum dikonfigurasi: isi MERCURY_API_KEY "
+        "(atau INCEPTION_API_KEY) di environment."
+    )
+
+    def _get_api_key(self) -> str:
+        for env_name in self.api_key_envs:
+            value = (os.getenv(env_name) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def __init__(self, persona_file="agents/kurisu.json"):
+        self._api_key = self._get_api_key()
+        self.available = bool(self._api_key)
+        self.client = AsyncOpenAI(
+            api_key=self._api_key or "openai-compatible-key-not-set",
+            base_url=self.base_url,
+            timeout=self.timeout_s,
+            max_retries=0,  # fallback model ditangani eksplisit di bawah
+        )
+        self.last_model_used = self.primary_model
+        self.last_usage = None
+        self.model_name = self.primary_model
+        self._temperature = _bounded_temperature(
+            self.temperature_env,
+            default=self.temperature_default,
+            lower=self.temperature_min,
+            upper=self.temperature_max,
+        )
+        self._model_candidates = []
+        for m in (self.primary_model, self.fallback_model):
+            if m and m not in self._model_candidates:
+                self._model_candidates.append(m)
+        if not self._model_candidates:
+            self._model_candidates = [self.primary_model]
+
+        with open(persona_file, "r", encoding="utf-8") as person:
+            self._agent_personality = json.load(person)
+
+        self._agent_instruction = build_instruction(self._agent_personality)
+
+    def _request_kwargs(self, model: str, messages: list, tools: list) -> dict:
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": self._temperature,
+            "max_completion_tokens": self.max_completion_tokens,
+        }
+        # reasoning_effort dipakai Mercury, sedangkan LARP Router tetap memakai
+        # payload OpenAI-compatible standar tanpa extra body tambahan.
+        if self.reasoning_effort:
+            kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
+        if tools:
+            kwargs["tools"] = tools
+        return kwargs
+
+    async def chat(self, prompt: str, lang: str = "id", session_id: str = None, user_id: str = None, admin_role: str = None):
+        if not self.available:
+            raise RuntimeError(self.missing_key_message)
+
+        lang_instruction = (
+            "IMPORTANT: You MUST respond in English. All explanations, suggestions, and conversation MUST be in English."
+            if lang == "en" else
+            "IMPORTANT: Anda HARUS merespons dalam Bahasa Indonesia. Semua penjelasan, saran, dan percakapan HARUS dalam Bahasa Indonesia."
+        )
+        system_content = f"{self._agent_instruction}\n\n{lang_instruction}"
+
+        is_portfolio = is_portfolio_persona(self._agent_personality)
+        all_tools = await get_mcp_tools()
+        tools = await _filter_relevant_tools(prompt, all_tools, always_include_device_tools=is_portfolio) if all_tools else []
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": prompt},
+        ]
+
+        self.last_usage = None
+        usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        steps = 0
+
+        while True:
+            round_content = ""
+            round_tool_calls = {}
+            streamed_any = False
+
+            for attempt_model in self._model_candidates:
+                round_content = ""
+                round_tool_calls = {}
+                streamed_any = False
+
+                try:
+                    if attempt_model != self._model_candidates[0]:
+                        print(f"[{self.log_label}] Fallback ke {attempt_model} (model primer limit/error).")
+
+                    stream = await self.client.chat.completions.create(
+                        **self._request_kwargs(attempt_model, messages, tools)
+                    )
+
+                    async for chunk in stream:
+                        # Chunk terakhir (stream_options.include_usage) tidak punya choices.
+                        chunk_usage = getattr(chunk, "usage", None)
+                        if chunk_usage:
+                            usage_totals["prompt_tokens"] += getattr(chunk_usage, "prompt_tokens", 0) or 0
+                            usage_totals["completion_tokens"] += getattr(chunk_usage, "completion_tokens", 0) or 0
+                            usage_totals["total_tokens"] += getattr(chunk_usage, "total_tokens", 0) or 0
+                            details = getattr(chunk_usage, "completion_tokens_details", None)
+                            usage_totals["reasoning_tokens"] += getattr(details, "reasoning_tokens", 0) or 0
+
+                        if not getattr(chunk, "choices", None):
+                            continue
+
+                        delta = chunk.choices[0].delta
+
+                        # 1. Stream teks ke client
+                        text = getattr(delta, "content", None)
+                        if text:
+                            round_content += text
+                            streamed_any = True
+                            yield f"data: {json.dumps({'text': text})}\n\n"
+
+                        # 2. Opsional: stream ringkasan reasoning (default mati)
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning and self.stream_reasoning:
+                            yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
+
+                        # 3. Akumulasi tool call delta (paralel per index)
+                        deltas = getattr(delta, "tool_calls", None)
+                        if deltas:
+                            for tc in deltas:
+                                index = tc.index if getattr(tc, "index", None) is not None else 0
+                                entry = round_tool_calls.setdefault(
+                                    index, {"id": "", "name": "", "arguments": ""}
+                                )
+                                if getattr(tc, "id", None):
+                                    entry["id"] = tc.id
+                                fn = getattr(tc, "function", None)
+                                if fn is not None:
+                                    if getattr(fn, "name", None):
+                                        entry["name"] = fn.name
+                                    if getattr(fn, "arguments", None):
+                                        entry["arguments"] += fn.arguments
+                                if getattr(tc, "id", None) or (
+                                    fn is not None and (getattr(fn, "name", None) or getattr(fn, "arguments", None))
+                                ):
+                                    streamed_any = True
+
+                    break  # sukses — keluar dari loop fallback
+                except Exception as stream_err:
+                    is_last = attempt_model == self._model_candidates[-1]
+                    if is_last or streamed_any or not _is_mercury_fallbackable(stream_err):
+                        raise
+                    print(
+                        f"[{self.log_label} WARN] {attempt_model} gagal "
+                        f"({stream_err or type(stream_err).__name__}); coba fallback."
+                    )
+
+            self.last_model_used = attempt_model
+
+            if not round_tool_calls:
+                break
+
+            formatted_tool_calls = []
+            for idx, tc in sorted(round_tool_calls.items()):
+                if not tc["name"]:
+                    continue  # delta tanpa nama fungsi tidak bisa dieksekusi
+                formatted_tool_calls.append({
+                    "id": tc["id"] or f"call_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"] or "{}",
+                    },
+                })
+
+            if not formatted_tool_calls:
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": round_content or None,
+                "tool_calls": formatted_tool_calls,
+            })
+
+            non_device_calls = [tc for tc in formatted_tool_calls if tc["function"]["name"] not in DEVICE_TOOL_NAMES]
+            device_calls = [tc for tc in formatted_tool_calls if tc["function"]["name"] in DEVICE_TOOL_NAMES]
+
+            # Device tools dieksekusi lokal (tanpa koneksi MCP)
+            for tc in device_calls:
+                tool_name = tc["function"]["name"]
+                try:
+                    tool_args = json.loads(tc["function"]["arguments"] or "{}")
+                except Exception:
+                    tool_args = {}
+
+                print(f"[{self.log_label} DEVICE TOOL] Calling tool: '{tool_name}' with args: {tool_args}")
+
+                is_authorized = True
+                auth_error = ""
+                if admin_role == "sales":
+                    is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
+
+                if is_authorized:
+                    try:
+                        result_text = await execute_device_tool(user_id, tool_name, tool_args, tc["id"])
+                    except Exception as e:
+                        result_text = f"Error executing tool: {str(e)}"
+                else:
+                    result_text = f"Error: {auth_error}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tool_name,
+                    "content": result_text,
+                })
+
+            # MCP tools: koneksi hanya dibuka saat benar-benar dipanggil
+            if non_device_calls:
+                try:
+                    async with _mcp_session() as session:
+                        for tc in non_device_calls:
+                            tool_name = tc["function"]["name"]
+                            try:
+                                tool_args = json.loads(tc["function"]["arguments"] or "{}")
+                            except Exception:
+                                tool_args = {}
+
+                            if session_id and (tool_name == "buat_booking" or "session_id" in tool_args):
+                                tool_args["session_id"] = session_id
+
+                            print(f"[{self.log_label} MCP] Calling tool: '{tool_name}' with args: {tool_args}")
+
+                            is_authorized = True
+                            auth_error = ""
+                            if admin_role == "sales":
+                                is_authorized, auth_error = _check_sales_authorization(tool_name, tool_args)
+
+                            if is_authorized:
+                                try:
+                                    result = await session.call_tool(tool_name, tool_args)
+                                    result_text = ""
+                                    if hasattr(result, "content") and result.content:
+                                        for part in result.content:
+                                            if hasattr(part, "text") and part.text:
+                                                result_text += part.text
+                                            elif isinstance(part, dict) and part.get("type") == "text":
+                                                result_text += part.get("text", "")
+                                            else:
+                                                result_text += str(part)
+                                    else:
+                                        result_text = str(result)
+                                except Exception as e:
+                                    result_text = f"Error executing tool: {str(e)}"
+                            else:
+                                result_text = f"Error: {auth_error}"
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": tool_name,
+                                "content": result_text,
+                            })
+                except Exception as conn_err:
+                    print(f"[{self.log_label} MCP CONNECTION ERROR] Failed to connect for tool calling: {conn_err}")
+                    for tc in non_device_calls:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "content": f"Failed to connect to MCP server for execution: {conn_err}",
+                        })
+
+            # Cache session di Redis sudah tidak valid setelah tool call
+            if session_id:
+                from services.redis_service import redis_client
+                sess_key = f"pa:session:{session_id}" if is_portfolio else f"session:{session_id}"
+                msg_key = f"pa:messages:{session_id}" if is_portfolio else f"messages:{session_id}"
+                try:
+                    await redis_client.delete(sess_key)
+                    await redis_client.delete(msg_key)
+                    print(f"[REDIS] Cache invalidated for session {session_id} after tool calls.")
+                except Exception as redis_err:
+                    print(f"[REDIS WARN] Failed to delete session cache: {redis_err}")
+
+            steps += 1
+            if steps >= self.max_steps:
+                note = (
+                    "Batas langkah tool call tercapai; jawaban dihentikan agar tidak berputar."
+                    if lang != "en" else
+                    "Tool-call step limit reached; stopping to avoid a loop."
+                )
+                yield f"data: {json.dumps({'text': f'[{note}]'})}\n\n"
+                break
+
+        if any(usage_totals.values()):
+            self.last_usage = usage_totals
+
+        # Event meta per-request: aman untuk konkurensi (instance engine dipakai
+        # bersama semua user, jadi last_usage/last_model_used saja bisa tertukar).
+        meta_payload = {"model": self.last_model_used}
+        if any(usage_totals.values()):
+            meta_payload["usage"] = usage_totals
+        yield f"data: {json.dumps({'meta': meta_payload})}\n\n"
+
+
+class DeepSeekAgentEngine(MercuryAgentEngine):
+    """Engine DeepSeek melalui LARP Router dengan API OpenAI-compatible."""
+
+    provider = "larprouter"
+    api_key_envs = ("LARPROUTER_API_KEY",)
+    base_url = LARPROUTER_BASE_URL
+    primary_model = LARPROUTER_MODEL
+    fallback_model = LARPROUTER_FALLBACK_MODEL
+    max_completion_tokens = LARPROUTER_MAX_COMPLETION_TOKENS
+    timeout_s = LARPROUTER_TIMEOUT_S
+    max_steps = LARPROUTER_MAX_STEPS
+    stream_reasoning = False
+    reasoning_effort = ""
+    temperature_env = "LARPROUTER_TEMPERATURE"
+    temperature_min = 0.0
+    temperature_max = 2.0
+    temperature_default = 0.75
+    log_label = "LARPROUTER/DEEPSEEK"
+    missing_key_message = (
+        "DeepSeek belum dikonfigurasi: isi LARPROUTER_API_KEY di environment."
+    )
+
+    def __init__(self, persona_file="agents/vienna.json"):
+        super().__init__(persona_file=persona_file)
+
+
+class LyberAgentEngine(MercuryAgentEngine):
+    """Engine model abliterated melalui Lyber AI (API OpenAI-compatible).
+
+    Jalur model agent administrator (vault: Arsitektur Dua Agent).
+    Model default kimi-k31-pro-abliterated; ganti lewat LYBER_MODEL.
+    """
+
+    provider = "lyber"
+    api_key_envs = ("LYBER_API_KEY",)
+    base_url = LYBER_BASE_URL
+    primary_model = LYBER_MODEL
+    fallback_model = LYBER_FALLBACK_MODEL
+    max_completion_tokens = LYBER_MAX_COMPLETION_TOKENS
+    timeout_s = LYBER_TIMEOUT_S
+    max_steps = LYBER_MAX_STEPS
+    stream_reasoning = False
+    reasoning_effort = ""
+    temperature_env = "LYBER_TEMPERATURE"
+    temperature_min = 0.0
+    temperature_max = 2.0
+    temperature_default = 0.75
+    log_label = "LYBER"
+    missing_key_message = (
+        "Lyber belum dikonfigurasi: isi LYBER_API_KEY di environment."
+    )
+
+    def __init__(self, persona_file="agents/vienna.json"):
+        super().__init__(persona_file=persona_file)
+
+
 # GOOGLE GEMINI API (Menggunakan Google GenAI SDK resmi)
 class GeminiAgentEngine:
+    provider = "gemini"
+
     def __init__(self, persona_file="agents/kurisu.json"):
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        self.available = bool(api_key)
+        self.client = genai.Client(api_key=api_key) if self.available else None
         self.last_model_used = CHAT_PRIMARY_MODEL
         with open(persona_file, "r", encoding="utf-8") as person:
             self._agent_personality = json.load(person)
@@ -886,6 +1370,8 @@ class GeminiAgentEngine:
         self._agent_instruction = build_instruction(self._agent_personality)
 
     async def chat(self, prompt: str, lang: str = "id", session_id: str = None, user_id: str = None, admin_role: str = None):
+        if not self.available:
+            raise RuntimeError("Gemini belum dikonfigurasi: isi GEMINI_API_KEY di environment.")
         lang_instruction = (
             "IMPORTANT: You MUST respond in English. All explanations, suggestions, and conversation MUST be in English."
             if lang == "en" else
@@ -1096,9 +1582,6 @@ class GeminiAgentEngine:
                     print(f"[REDIS] Cache invalidated for session {session_id} after tool calls.")
                 except Exception as redis_err:
                     print(f"[REDIS WARN] Failed to delete session cache: {redis_err}")
-            
+
             # Tambahkan hasil eksekusi tool dari user ke percakapan
             contents.append(types.Content(role="user", parts=tool_response_parts))
-
-
-            

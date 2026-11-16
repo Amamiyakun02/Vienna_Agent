@@ -1,0 +1,82 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // ============================================================
+  // INSTANCE ADMIN — lewat System Dashboard (sudah login)
+  // File ini yang nanti disalin ke AKAR project Vienna_Agent
+  // (~/apps/Vienna_Agent/opencode.jsonc di VPS), dan serve admin
+  // dijalankan dari folder project itu. Port 4096 = yang sudah
+  // dipakai routers/opencode_api.py sekarang (OPENCODE_BASE_URL).
+  // Approval & audit TIDAK di sini: itu gerbang dashboard/backend
+  // SEBELUM prompt dikirim. Di serve headless jangan pakai "ask".
+  // ============================================================
+
+  "model": "lyber/kimi-k31-pro-abliterated",
+  "default_agent": "admin",
+
+  "providers": {
+    "lyber": {
+      "name": "Lyber",
+      "env": ["LYBER_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://api.lyber.ai/v1" },
+      "models": {
+        "kimi-k31-pro-abliterated": {
+          "name": "Kimi K3.1 Pro Abliterated (Lyber)",
+          // PLACEHOLDER context — verifikasi sebelum live (lihat publik).
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
+    },
+    "inception": {
+      "name": "Inception Labs (Mercury)",
+      "env": ["MERCURY_API_KEY", "INCEPTION_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://api.inceptionlabs.ai/v1" },
+      "models": {
+        "mercury-3": {
+          "name": "Mercury 3",
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
+    }
+  },
+
+  "instructions": [".opencode/instructions/*.md"],
+
+  "compaction": {
+    "auto": true,
+    "keep": { "tokens": 15000 },
+    "buffer": "15%"
+  },
+
+  "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
+
+  "mcp": {
+    "timeout": { "startup": 30000, "catalog": 30000, "execution": 600000 },
+    "servers": {
+      "vienna": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8001/mcp",
+        "oauth": false,
+        "codemode": false
+      }
+    }
+  },
+
+  "agents": {
+    "admin": {
+      "description": "Agent administrator Amamiya via System Dashboard",
+      "mode": "primary",
+      "model": "lyber/kimi-k31-pro-abliterated",
+      "steps": 30,
+      "system": "Kamu adalah agent administrator untuk Amamiya, dijalankan lewat System Dashboard yang sudah ter-login. Kamu boleh bekerja penuh di server ini. Wajib: jangan pernah membaca file .env atau menampilkan kredensial; untuk aksi destruktif (hapus data, deploy, restart service) sebutkan dulu di jawaban apa yang akan dilakukan dan tunggu perintah eksplisit di pesan berikutnya. Ikuti protokol memory di instruksi.",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "shell", "resource": "sudo *", "effect": "deny" }
+      ]
+    }
+  }
+}

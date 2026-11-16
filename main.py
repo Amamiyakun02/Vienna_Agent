@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
-from services import AgentEngine, GeminiAgentEngine, MercuryAgentEngine, DeepSeekAgentEngine
+from services import AgentEngine, GeminiAgentEngine, MercuryAgentEngine, DeepSeekAgentEngine, LyberAgentEngine
 from services.github_service import sync_github_repositories
 from utils.prompt_builder import build_prompt
 from typing import Optional, List, Dict, Any
@@ -156,6 +156,7 @@ agent_vienna = AgentEngine(persona_file="agents/vienna.json")
 agent_gemini = GeminiAgentEngine(persona_file="agents/vienna.json")
 agent_mercury = MercuryAgentEngine(persona_file="agents/vienna.json")
 agent_deepseek = DeepSeekAgentEngine(persona_file="agents/vienna.json")
+agent_lyber = LyberAgentEngine(persona_file="agents/vienna.json")
 
 
 from routers.auth_api import router as auth_router
@@ -630,6 +631,16 @@ async def deepseek_chat(payload: ChatRequest = Body(...), request: Request = Non
     return await process_chat(payload, agent_deepseek, request=request)
 
 
+@app.post("/v1/lyber/chat")
+async def lyber_chat(payload: ChatRequest = Body(...), request: Request = None):
+    """Chat via Lyber AI (API OpenAI-compatible), model abliterated.
+
+    Butuh LYBER_API_KEY. Model default `kimi-k31-pro-abliterated` —
+    bisa diatur lewat env LYBER_MODEL.
+    """
+    return await process_chat(payload, agent_lyber, request=request)
+
+
 @app.get("/v1/engines")
 async def list_engines():
     """Daftar engine chat yang tersedia + status konfigurasi API key."""
@@ -658,6 +669,14 @@ async def list_engines():
                 "model": getattr(agent_deepseek, "model_name", "deepseek-v4.1-flash"),
                 "endpoint": "/v1/deepseek/chat",
                 "available": bool(getattr(agent_deepseek, "available", False)),
+            },
+            {
+                "id": "lyber",
+                "label": "Lyber AI (Abliterated)",
+                "provider": getattr(agent_lyber, "provider", "lyber"),
+                "model": getattr(agent_lyber, "model_name", "kimi-k31-pro-abliterated"),
+                "endpoint": "/v1/lyber/chat",
+                "available": bool(getattr(agent_lyber, "available", False)),
             },
             {
                 "id": "opencode",
@@ -698,11 +717,14 @@ async def list_models():
     gemini_avail = bool(os.getenv("GEMINI_API_KEY"))
     mercury_avail = bool(getattr(agent_mercury, "available", False) or os.getenv("MERCURY_API_KEY") or os.getenv("INCEPTION_API_KEY"))
     deepseek_avail = bool(getattr(agent_deepseek, "available", False) or os.getenv("LARPROUTER_API_KEY"))
+    lyber_model = getattr(agent_lyber, "model_name", os.getenv("LYBER_MODEL", "kimi-k31-pro-abliterated"))
+    lyber_avail = bool(getattr(agent_lyber, "available", False) or os.getenv("LYBER_API_KEY"))
 
     data = [
         _format_model_entry("gemini", "google", "gemini", gemini_avail, tools=True, vision=True),
         _format_model_entry("mercury", "inception", "mercury", mercury_avail, tools=True, vision=False),
         _format_model_entry("deepseek", "larprouter", "deepseek", deepseek_avail, tools=True, vision=False),
+        _format_model_entry("lyber", "lyber", "lyber", lyber_avail, tools=True, vision=False),
         _format_model_entry("vienna", "vienna-agent", "vienna", True, tools=True, vision=True),
     ]
     if gemini_model not in ("gemini", ""):
@@ -711,6 +733,8 @@ async def list_models():
         data.append(_format_model_entry(mercury_model, "inception", "mercury", mercury_avail, tools=True, vision=False))
     if deepseek_model not in ("deepseek", ""):
         data.append(_format_model_entry(deepseek_model, "larprouter", "deepseek", deepseek_avail, tools=True, vision=False))
+    if lyber_model not in ("lyber", ""):
+        data.append(_format_model_entry(lyber_model, "lyber", "lyber", lyber_avail, tools=True, vision=False))
 
     return {
         "object": "list",
@@ -741,6 +765,8 @@ def _engine_for(name: Optional[str]):
         return agent_mercury
     if normalized in ("deepseek", "larprouter", "deepseek-v4.1-flash"):
         return agent_deepseek
+    if normalized in ("lyber", "kimi-k31-pro-abliterated"):
+        return agent_lyber
     return agent_gemini
 
 
@@ -816,7 +842,7 @@ async def assistant_list_sessions(user_id: str, engine: Optional[str] = "gemini"
 
 
 
-async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine | MercuryAgentEngine | DeepSeekAgentEngine, request: Request = None):
+async def process_chat(payload: ChatRequest, current_agent: AgentEngine | GeminiAgentEngine | MercuryAgentEngine | DeepSeekAgentEngine | LyberAgentEngine, request: Request = None):
     try:
         messages = payload.messages or []
         user_id = payload.user_id

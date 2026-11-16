@@ -8,4 +8,12 @@ from .mongo_service import (
     create_session, count_session_messages, archive_session,
     MAX_MSGS_PER_SESSION, SESSION_IDLE_DAYS,
 )
-from .agent_service import AgentEngine, GeminiAgentEngine, is_portfolio_persona, PORTFOLIO_ASSISTANT_IDS
+from .agent_service import (
+    AgentEngine,
+    GeminiAgentEngine,
+    MercuryAgentEngine,
+    DeepSeekAgentEngine,
+    LyberAgentEngine,
+    is_portfolio_persona,
+    PORTFOLIO_ASSISTANT_IDS,
+)

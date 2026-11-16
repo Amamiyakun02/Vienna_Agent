@@ -19,7 +19,7 @@ Proyek ini dibangun oleh **Amamiya (Maireza)**, seorang **AI Application & Autom
 | Komponen | Teknologi |
 |---|---|
 | **Framework Backend** | FastAPI (Python 3.12+) |
-| **LLM Integration** | Gemini SDK, OpenAI SDK, Google GenAI |
+| **LLM Integration** | Gemini SDK, OpenAI SDK, Google GenAI, Inception Labs Mercury (OpenAI-compatible) |
 | **RAG Pipeline** | Qdrant Vector Database |
 | **Database Utama** | MongoDB (Atlas) |
 | **Cache / Queue** | Redis |
@@ -43,6 +43,25 @@ Proyek ini dibangun oleh **Amamiya (Maireza)**, seorang **AI Application & Autom
 - Dukungan multi-bahasa (Indonesia & English)
 - Role-based access: `customer`, `superadmin`, `sales`
 
+**Engine yang tersedia:**
+
+| Engine | Endpoint | Model default | API key |
+|---|---|---|---|
+| Gemini | `POST /v1/gemini/chat` | `gemini-3.1-flash-lite` (fallback `gemini-3.5-flash-lite`) | `GEMINI_API_KEY` |
+| Mercury (Inception Labs) | `POST /v1/mercury/chat` | `mercury-3` (fallback `mercury-2.5`) | `MERCURY_API_KEY` / `INCEPTION_API_KEY` |
+| DeepSeek (LARP Router) | `POST /v1/deepseek/chat` | `deepseek-v4.1-flash` | `LARPROUTER_API_KEY` |
+
+Mercury memakai REST API OpenAI-compatible (`https://api.inceptionlabs.ai/v1`), jadi
+tidak menambah dependency. Engine ini mendukung streaming SSE, MCP tool calling,
+device tool, dan mengirim `usage` token asli ke client. Pilih engine per request
+lewat field `engine` (`"gemini"`/`"mercury"`/`"deepseek"`) saat membuat session, lalu kirim chat
+ke endpoint yang sesuai. Cek kesiapan key via `GET /v1/engines`.
+
+DeepSeek menggunakan REST API OpenAI-compatible LARP Router
+(`https://larprouter.com/v1`). Konfigurasikan `LARPROUTER_API_KEY` dan, bila perlu,
+override `LARPROUTER_MODEL`. Endpoint alias provider tersedia di
+`POST /v1/larprouter/chat`.
+
 ### 2. **WebSocket Device API**
 - Komunikasi real-time dengan perangkat mobile Android
 - Device registration dengan FCM token
@@ -53,6 +72,9 @@ Proyek ini dibangun oleh **Amamiya (Maireza)**, seorang **AI Application & Autom
 ### 3. **Router & API Endpoints**
 - **`/v1/assistant/chat`** — Chat utama dengan agent Vienna
 - **`/v1/gemini/chat`** — Chat via Gemini API
+- **`/v1/mercury/chat`** — Chat via Inception Labs Mercury (alias `/v1/inception/chat`)
+- **`/v1/deepseek/chat`** — Chat via DeepSeek melalui LARP Router (alias `/v1/larprouter/chat`)
+- **`/v1/engines`** — Daftar engine chat + status konfigurasi API key
 - **`/v1/auth`** — Autentikasi JWT
 - **`/v1/pdf`** — Analisis dokumen PDF (PyMuPDF + AI summary)
 - **`/v1/anime`** — Pencarian dan download link anime
@@ -109,7 +131,7 @@ myAgentic-apps/
 │   └── gemini_live.py         # Gemini live streaming
 │
 ├── services/                   # Core business logic & integrations
-│   ├── agent_service.py       # MCP tools & agent orchestration
+│   ├── agent_service.py       # MCP tools & agent orchestration (Gemini/OpenAI/Mercury)
 │   ├── mongo_service.py       # MongoDB database operations
 │   ├── redis_service.py       # Redis cache & session
 │   ├── qdrant_service.py      # Qdrant vector search
@@ -210,6 +232,10 @@ FastAPI menyediakan automatic API documentation:
 | `GET` | `/` | Health check — "Hello World" |
 | `POST` | `/v1/assistant/chat` | Chat dengan agent Vienna (streaming) |
 | `POST` | `/v1/gemini/chat` | Chat dengan Gemini API (streaming) |
+| `POST` | `/v1/mercury/chat` | Chat dengan Inception Labs Mercury (streaming, alias `/v1/inception/chat`) |
+| `POST` | `/v1/deepseek/chat` | Chat dengan DeepSeek via LARP Router (streaming) |
+| `GET` | `/v1/engines` | Daftar engine chat + status API key |
+| `GET` | `/v1/models` | OpenAI-compatible discovery endpoint (alias `/models`, `/v1/models/{id}`) |
 | `POST` | `/v1/device/register` | Registrasi device mobile |
 | `WS` | `/v1/assistant/ws` | WebSocket device communication |
 | `POST` | `/v1/github/sync` | Trigger GitHub sync |
@@ -233,8 +259,10 @@ FastAPI menyediakan automatic API documentation:
 
 ### Qdrant Vector DB
 - Semantic search untuk RAG pipeline
-- Koleksi: `document_chunk`, `portfolio_document_chunk`
+- Koleksi: `document_chunk`, `portfolio_document_chunk` (768-dim Gemini, Cosine)
 - Retrieval konteks yang relevan untuk chat response
+- Default lokal: `QDRANT_URL=http://localhost:6333` (API key boleh kosong). Qdrant Cloud: isi URL https + API key.
+- Bila Qdrant mati, startup menampilkan error jelas dan chat tetap jalan tanpa konteks RAG.
 
 ### Firebase
 - Push notification via FCM

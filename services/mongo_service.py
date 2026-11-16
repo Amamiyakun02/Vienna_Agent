@@ -362,22 +362,22 @@ async def get_or_create_session(user_id: str, session_id: str = None, role: str 
                 existing = None  # lanjut ke pembuatan session baru di bawah
         if existing:
             sess_id = existing.get("session_id")
-        if sess_id:
-            cache_key = f"pa:session:{sess_id}" if is_portfolio else f"session:{sess_id}"
-            if "role" not in existing or existing.get("role") != role:
-                existing["role"] = role
-                await col.update_one({"user_id": user_id}, {"$set": {"role": role}})
+            if sess_id:
+                cache_key = f"pa:session:{sess_id}" if is_portfolio else f"session:{sess_id}"
+                if "role" not in existing or existing.get("role") != role:
+                    existing["role"] = role
+                    await col.update_one({"user_id": user_id}, {"$set": {"role": role}})
+                    try:
+                        await redis_client.delete(cache_key)
+                    except Exception:
+                        pass
+                if not is_portfolio:
+                    await sync_customer_info(existing)
                 try:
-                    await redis_client.delete(cache_key)
-                except Exception:
-                    pass
-            if not is_portfolio:
-                await sync_customer_info(existing)
-            try:
-                await redis_client.setex(cache_key, 3600, serialize_for_cache(existing))
-            except Exception as e:
-                print(f"[REDIS WARN] Failed to set session cache: {e}")
-        return existing
+                    await redis_client.setex(cache_key, 3600, serialize_for_cache(existing))
+                except Exception as e:
+                    print(f"[REDIS WARN] Failed to set session cache: {e}")
+            return existing
 
     new_session = await create_session(user_id, session_id=session_id, role=role, is_portfolio=is_portfolio)
     created_sess = await col.find_one({"session_id": new_session["session_id"]})

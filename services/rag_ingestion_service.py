@@ -24,9 +24,26 @@ async def _ensure_collection(client, name: str):
     Bila koleksi ada tapi dimensinya beda (mis. pindah openai 1536 -> gemini
     768), koleksi di-recreate kosong — vektor lama beda ruang embedding dan
     tidak bisa dipakai query baru. Isi ulang via ingest_document_embedding.
+
+    Error koneksi/auth TIDAK boleh dianggap "koleksi belum ada" — kalau
+    dianggap begitu, startup akan mencoba create dan menutupi penyebab asli
+    dengan pesan error kosong.
     """
     try:
         info = await client.get_collection(name)
+    except UnexpectedResponse as e:
+        if e.status_code != 404:
+            raise RuntimeError(
+                f"Qdrant menolak cek koleksi '{name}' (HTTP {e.status_code}). "
+                "Periksa QDRANT_URL/QDRANT_API_KEY."
+            ) from e
+        # 404 = koleksi memang belum ada, lanjut buat di bawah.
+    except Exception as e:
+        raise RuntimeError(
+            f"Qdrant tidak bisa dihubungi saat cek koleksi '{name}': "
+            f"{type(e).__name__}: {e}"
+        ) from e
+    else:
         current_size = info.config.params.vectors.size
         if current_size == EMBEDDING_DIM:
             print(f"[OK] Qdrant collection '{name}' already exists "
@@ -35,13 +52,7 @@ async def _ensure_collection(client, name: str):
         print(f"[MIGRATE] Collection '{name}' dim={current_size} != {EMBEDDING_DIM} "
               f"(provider={EMBEDDING_PROVIDER}) — recreating...")
         await client.delete_collection(name)
-    except UnexpectedResponse as e:
-        if e.status_code != 404:
-            print(f"[ERROR] Qdrant connection/response error for '{name}': {e}")
-            raise e
-    except Exception as e:
-        # delete_collection pada koleksi tak ada / error koneksi — lanjut ke create
-        print(f"[INFO] Recreating Qdrant collection '{name}': {e}")
+
     print(f"Creating Qdrant collection '{name}' (dim={EMBEDDING_DIM})...")
     await client.create_collection(
         collection_name=name,
