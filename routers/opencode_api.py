@@ -16,15 +16,22 @@ Kontrak opencode serve v2 (terverifikasi live di laptop, v2.2.2):
   content[] berisi part {type: "text"|"tool"|...}; pesan type "idle"
   membawa outcome succeeded/failed + error terstruktur)
 
-shortcut: jawaban dikumpulkan sesudah sesi idle (bukan streaming SSE
-seperti engine lama). Cukup untuk v1; upgrade ke passthrough
-GET /api/event (SSE) bila frontend butuh token-by-token.
+POST /chat menunggu jawaban final (prompt -> wait -> ambil pesan).
+POST /chat/stream meneruskan event SSE serve (GET /api/event) ke klien:
+event V2 berbentuk {type, data:{sessionID, ...}} — yang diteruskan
+"session.text.delta" (data.delta), "session.tool.input.started"
+(data.name), ditutup "session.execution.succeeded"/"failed". Format
+keluaran meniru SSE process_chat: {"text": ...} per potongan,
+{"meta": {...}} untuk penanda, {"done": true, ...} penutup,
+{"error": ...} bila gagal.
 """
 
+import json
 import os
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/v1/opencode", tags=["OpenCode Agent"])
@@ -193,3 +200,85 @@ async def chat(body: ChatIn):
         "agent": assistant.get("agent"),
         "model": model,
     }
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(body: ChatIn):
+    """Versi streaming dari /chat: teks tampil per potongan (SSE).
+
+    Berlangganan GET /api/event DULU, baru kirim prompt, supaya tidak
+    ada delta awal yang terlewat. Aliran event serve itu global (semua
+    sesi) — disaring di sini berdasarkan sessionID sesi ini.
+    """
+    session_id = body.session_id or await _create_session(
+        SessionIn(agent=body.agent, model=body.model)
+    )
+
+    async def gen():
+        yield _sse({"meta": {"session_id": session_id}})
+        tools_used: list[str] = []
+        model_id: str | None = None
+        usage = None
+        timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
+        try:
+            async with httpx.AsyncClient(base_url=BASE_URL, auth=AUTH, timeout=timeout) as client:
+                async with client.stream("GET", "/api/event") as resp:
+                    if resp.status_code >= 400:
+                        yield _sse({"error": f"opencode serve menjawab {resp.status_code} untuk /api/event"})
+                        return
+                    pr = await client.post(
+                        f"/api/session/{session_id}/prompt", json={"text": body.prompt}
+                    )
+                    if pr.status_code >= 400:
+                        yield _sse({"error": f"prompt ditolak serve: {pr.status_code}"})
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except ValueError:
+                            continue
+                        data = ev.get("data") or {}
+                        if data.get("sessionID") != session_id:
+                            continue
+                        etype = ev.get("type")
+                        if etype == "session.text.delta":
+                            delta = data.get("delta") or ""
+                            if delta:
+                                yield _sse({"text": delta})
+                        elif etype == "session.tool.input.started":
+                            name = data.get("name")
+                            if name:
+                                tools_used.append(name)
+                                yield _sse({"meta": {"tool": name}})
+                        elif etype == "session.step.started":
+                            model_id = (data.get("model") or {}).get("id") or model_id
+                        elif etype == "session.usage.updated":
+                            usage = {"cost": data.get("cost"), "tokens": data.get("tokens")}
+                        elif etype == "session.execution.succeeded":
+                            break
+                        elif etype == "session.execution.failed":
+                            err = (data.get("error") or {}).get("message") or "agent gagal"
+                            yield _sse({"error": err})
+                            return
+        except httpx.HTTPError as exc:
+            yield _sse({"error": f"aliran event opencode terputus: {exc}"})
+            return
+        yield _sse({
+            "done": True,
+            "session_id": session_id,
+            "tools_used": tools_used,
+            "model": model_id,
+            "usage": usage,
+        })
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
