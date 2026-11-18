@@ -41,7 +41,10 @@ router = APIRouter(prefix="/v1/opencode", tags=["OpenCode Agent"])
 BASE_URL = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096").rstrip("/")
 PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 DEFAULT_AGENT = os.getenv("OPENCODE_AGENT", "vienna")
-DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "").strip()  # format "providerID/modelID"
+# Model default sesi chat lewat API ini: Mercury — model agent publik
+# sesuai arsitektur (agent pribadi memakai model gratis opencode yang
+# kuota bersamanya bisa habis sewaktu-waktu). Ganti lewat env OPENCODE_MODEL.
+DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "").strip() or "inception/mercury-3"  # format "providerID/modelID"
 TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
@@ -82,7 +85,7 @@ class ChatIn(BaseModel):
     prompt: str
     session_id: str | None = None
     agent: str | None = None
-    model: str | None = None  # format "providerID/modelID"; hanya dipakai saat sesi baru dibuat
+    model: str | None = None  # format "providerID/modelID"; sesi lama disamakan modelnya
     hitl: bool = False  # True = klien bisa menjawab form/permission agent (lihat /chat/stream)
 
 
@@ -104,6 +107,22 @@ async def _create_session(body: SessionIn) -> str:
         payload["model"] = ref
     data = await _oc("POST", "/api/session", json=payload)
     return data["data"]["id"]
+
+
+async def _sync_session_model(session_id: str, model: str | None) -> None:
+    """Samakan model sesi lama dengan model pilihan/default (best-effort).
+
+    Model sesi opencode menempel sejak sesi dibuat; tanpa ini, sesi lama
+    yang dibuat dengan model lain (mis. model gratis yang kuotanya habis)
+    akan terus gagal walau model default sudah diganti.
+    """
+    ref = _model_ref(model or DEFAULT_MODEL)
+    if not ref:
+        return
+    try:
+        await _oc("POST", f"/api/session/{session_id}/model", json={"model": ref}, timeout=10.0)
+    except Exception:
+        pass
 
 
 @router.get("/status")
@@ -177,6 +196,8 @@ async def chat(body: ChatIn):
     session_id = body.session_id or await _create_session(
         SessionIn(agent=body.agent, model=body.model)
     )
+    if body.session_id:
+        await _sync_session_model(session_id, body.model)
     await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt})
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
@@ -241,6 +262,8 @@ async def chat_stream(body: ChatIn):
     session_id = body.session_id or await _create_session(
         SessionIn(agent=body.agent, model=body.model)
     )
+    if body.session_id:
+        await _sync_session_model(session_id, body.model)
 
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
