@@ -38,26 +38,49 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/v1/opencode", tags=["OpenCode Agent"])
 
+# Dua instance serve TERISOLASI sebagai core (paket opencode-core/):
+# publik = agent anonim pengunjung (terkunci, sandbox, Mercury);
+# admin = agent dashboard (nyaris penuh, Lyber). Serve PRIBADI user
+# tidak lagi dipakai backend. Di VPS admin memakai port 4096 (default
+# OPENCODE_BASE_URL); di laptop port itu ditempati serve pribadi,
+# jadi admin laptop diarahkan lewat env OPENCODE_ADMIN_BASE_URL.
 BASE_URL = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("OPENCODE_PUBLIC_BASE_URL", "http://127.0.0.1:4097").rstrip("/")
+ADMIN_BASE_URL = os.getenv("OPENCODE_ADMIN_BASE_URL", "").strip().rstrip("/") or BASE_URL
 PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 DEFAULT_AGENT = os.getenv("OPENCODE_AGENT", "vienna")
+PUBLIC_AGENT = os.getenv("OPENCODE_PUBLIC_AGENT", "public")
+ADMIN_AGENT = os.getenv("OPENCODE_ADMIN_AGENT", "admin")
 # Model default sesi chat lewat API ini: Mercury — model agent publik
 # sesuai arsitektur (agent pribadi memakai model gratis opencode yang
 # kuota bersamanya bisa habis sewaktu-waktu). Ganti lewat env OPENCODE_MODEL.
 DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "").strip() or "inception/mercury-3"  # format "providerID/modelID"
+ADMIN_MODEL = os.getenv("OPENCODE_ADMIN_MODEL", "").strip() or "lyber/kimi-k31-pro-abliterated"
 TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
 
-async def _oc(method: str, path: str, timeout: float = 30.0, **kwargs):
+def _target(role: str | None) -> tuple[str, str, str, str]:
+    """(role, base_url, agent_default, model_default) untuk satu role.
+
+    Default SELALU publik (hak paling kecil); admin hanya bila diminta
+    persis "admin" — pemilihnya nanti digerbang auth dashboard.
+    """
+    if (role or "").strip().lower() == "admin":
+        return "admin", ADMIN_BASE_URL, ADMIN_AGENT, ADMIN_MODEL
+    return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, DEFAULT_MODEL
+
+
+async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, **kwargs):
     """Satu pintu ke opencode serve; error diterjemahkan ke HTTP backend."""
+    base_url = base or ADMIN_BASE_URL
     try:
-        async with httpx.AsyncClient(base_url=BASE_URL, auth=AUTH, timeout=timeout) as client:
+        async with httpx.AsyncClient(base_url=base_url, auth=AUTH, timeout=timeout) as client:
             resp = await client.request(method, path, **kwargs)
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=503,
-            detail=f"opencode serve tidak terjangkau di {BASE_URL} — nyalakan ~/start-opencode-serve.sh ({exc})",
+            detail=f"opencode serve tidak terjangkau di {base_url} — nyalakan instance opencode-core terkait ({exc})",
         )
     if resp.status_code >= 400:
         raise HTTPException(
@@ -87,6 +110,7 @@ class ChatIn(BaseModel):
     agent: str | None = None
     model: str | None = None  # format "providerID/modelID"; sesi lama disamakan modelnya
     hitl: bool = False  # True = klien bisa menjawab form/permission agent (lihat /chat/stream)
+    role: str = "public"  # "public" (default, instance anonim) | "admin" (instance dashboard)
 
 
 class FormReplyIn(BaseModel):
@@ -98,74 +122,103 @@ class PermissionReplyIn(BaseModel):
     message: str | None = None
 
 
-async def _create_session(body: SessionIn) -> str:
-    payload: dict = {"agent": body.agent or DEFAULT_AGENT}
+async def _create_session(body: SessionIn, base: str, agent_default: str, model_default: str) -> str:
+    payload: dict = {"agent": body.agent or agent_default}
     if body.title:
         payload["title"] = body.title
-    ref = _model_ref(body.model or DEFAULT_MODEL)
+    ref = _model_ref(body.model or model_default)
     if ref:
         payload["model"] = ref
-    data = await _oc("POST", "/api/session", json=payload)
+    data = await _oc("POST", "/api/session", json=payload, base=base)
     return data["data"]["id"]
 
 
-async def _sync_session_model(session_id: str, model: str | None) -> None:
+async def _sync_session_model(session_id: str, model: str | None, base: str, model_default: str) -> None:
     """Samakan model sesi lama dengan model pilihan/default (best-effort).
 
     Model sesi opencode menempel sejak sesi dibuat; tanpa ini, sesi lama
     yang dibuat dengan model lain (mis. model gratis yang kuotanya habis)
     akan terus gagal walau model default sudah diganti.
     """
-    ref = _model_ref(model or DEFAULT_MODEL)
+    ref = _model_ref(model or model_default)
     if not ref:
         return
     try:
-        await _oc("POST", f"/api/session/{session_id}/model", json={"model": ref}, timeout=10.0)
+        await _oc("POST", f"/api/session/{session_id}/model", json={"model": ref}, timeout=10.0, base=base)
     except Exception:
         pass
 
 
+async def _ensure_session(body: ChatIn) -> tuple[str, str, str, str, str]:
+    """(session_id, base, role, agent_default, model_default) untuk chat.
+
+    Sesi baru dibuat di instance sesuai role. Sesi lama dipakai ulang
+    (modelnya disamakan); sesi lama yang TIDAK dikenal instance tujuan
+    — mis. dibuat di serve pribadi sebelum isolasi — diganti sesi baru
+    diam-diam supaya klien tidak nyangkut pada id yang yatim.
+    """
+    role, base, agent_default, model_default = _target(body.role)
+    if body.session_id:
+        try:
+            await _oc("GET", f"/api/session/{body.session_id}", timeout=10.0, base=base)
+        except HTTPException:
+            sid = await _create_session(
+                SessionIn(agent=body.agent, model=body.model), base, agent_default, model_default
+            )
+            return sid, base, role, agent_default, model_default
+        await _sync_session_model(body.session_id, body.model, base, model_default)
+        return body.session_id, base, role, agent_default, model_default
+    sid = await _create_session(
+        SessionIn(agent=body.agent, model=body.model), base, agent_default, model_default
+    )
+    return sid, base, role, agent_default, model_default
+
+
 @router.get("/status")
 async def status():
-    """Kesehatan jembatan backend -> opencode serve."""
-    try:
-        data = await _oc("GET", "/api/model/default", timeout=10.0)
-    except HTTPException as exc:
-        return {"status": "unreachable", "base_url": BASE_URL, "detail": exc.detail}
-    model = (data or {}).get("data") or {}
+    """Kesehatan jembatan backend -> KEDUA instance opencode-core."""
+    async def probe(base: str) -> dict:
+        try:
+            data = await _oc("GET", "/api/model/default", timeout=10.0, base=base)
+        except HTTPException as exc:
+            return {"status": "unreachable", "base_url": base, "detail": exc.detail}
+        model = (data or {}).get("data") or {}
+        return {"status": "ok", "base_url": base, "default_model": model.get("id")}
+
+    public = await probe(PUBLIC_BASE_URL)
+    admin = await probe(ADMIN_BASE_URL)
     return {
-        "status": "ok",
-        "base_url": BASE_URL,
-        "default_agent": DEFAULT_AGENT,
-        "default_model": model.get("id"),
+        "status": public["status"],
+        "base_url": PUBLIC_BASE_URL,
+        "default_agent": PUBLIC_AGENT,
+        "default_model": public.get("default_model"),
         "auth_configured": bool(PASSWORD),
+        "instances": {"public": public, "admin": admin},
     }
 
 
 @router.get("/models")
-async def list_models():
-    """Katalog model opencode serve, dikelompokkan per provider.
-
-    API key platform lain diisi user di .env backend (nama env standar
-    tiap provider) dan diteruskan ke serve oleh start-opencode-serve.sh;
-    model provider itu otomatis bisa dipilih lewat field "model"
-    ("providerID/modelID") pada POST /chat atau env OPENCODE_MODEL.
-    """
-    data = await _oc("GET", "/api/model")
+async def list_models(role: str = "public"):
+    """Katalog model satu instance opencode-core (?role=public|admin),
+    dikelompokkan per provider. Model bisa dipilih lewat field "model"
+    ("providerID/modelID") pada POST /chat."""
+    _, base, _, model_default = _target(role)
+    data = await _oc("GET", "/api/model", base=base)
     providers: dict[str, list[str]] = {}
     for m in (data or {}).get("data", []):
         providers.setdefault(m.get("providerID", "?"), []).append(m.get("id"))
     return {
         "status": "success",
         "total": sum(len(v) for v in providers.values()),
-        "default_model": DEFAULT_MODEL or None,
+        "default_model": model_default or None,
         "providers": {k: sorted(v) for k, v in sorted(providers.items())},
     }
 
 
 @router.get("/sessions")
-async def list_sessions():
-    data = await _oc("GET", "/api/session")
+async def list_sessions(role: str = "public"):
+    _, base, _, _ = _target(role)
+    data = await _oc("GET", "/api/session", base=base)
     sessions = [
         {"id": s.get("id"), "title": s.get("title"), "agent": s.get("agent"), "time": s.get("time")}
         for s in (data or {}).get("data", [])
@@ -174,14 +227,16 @@ async def list_sessions():
 
 
 @router.post("/sessions")
-async def create_session(body: SessionIn):
-    session_id = await _create_session(body)
+async def create_session(body: SessionIn, role: str = "public"):
+    _, base, agent_default, model_default = _target(role)
+    session_id = await _create_session(body, base, agent_default, model_default)
     return {"status": "success", "session_id": session_id}
 
 
 @router.get("/sessions/{session_id}/messages")
-async def session_messages(session_id: str):
-    data = await _oc("GET", f"/api/session/{session_id}/message")
+async def session_messages(session_id: str, role: str = "public"):
+    _, base, _, _ = _target(role)
+    data = await _oc("GET", f"/api/session/{session_id}/message", base=base)
     return {"status": "success", "messages": (data or {}).get("data", [])}
 
 
@@ -193,18 +248,14 @@ async def chat(body: ChatIn):
     itulah inti memakai harness-nya. Lanjutkan percakapan dengan
     mengembalikan session_id dari respons ke permintaan berikutnya.
     """
-    session_id = body.session_id or await _create_session(
-        SessionIn(agent=body.agent, model=body.model)
-    )
-    if body.session_id:
-        await _sync_session_model(session_id, body.model)
-    _log_chat(body, session_id)
-    await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt})
+    session_id, base, role, agent_default, model_default = await _ensure_session(body)
+    _log_chat(body, session_id, role, agent_default, model_default)
+    await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt}, base=base)
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
-        json={}, timeout=TIMEOUT_S,
+        json={}, timeout=TIMEOUT_S, base=base,
     )
-    data = await _oc("GET", f"/api/session/{session_id}/message")
+    data = await _oc("GET", f"/api/session/{session_id}/message", base=base)
     messages = sorted(
         (data or {}).get("data", []),
         key=lambda m: (m.get("time") or {}).get("created", 0),
@@ -242,14 +293,14 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _log_chat(body: ChatIn, session_id: str) -> None:
+def _log_chat(body: ChatIn, session_id: str, role: str, agent_default: str, model_default: str) -> None:
     """Satu baris log per permintaan chat — router ini memang sengaja
     tidak mencatat apa pun sebelumnya, makanya request opencode tidak
     terlihat di log backend (beda dengan process_chat yang print [PROMPT])."""
     preview = " ".join(body.prompt.split())[:80]
     print(
-        f"[OPENCODE] chat session={session_id} agent={body.agent or DEFAULT_AGENT} "
-        f"model={body.model or DEFAULT_MODEL} hitl={body.hitl} prompt={preview!r}",
+        f"[OPENCODE] chat session={session_id} role={role} agent={body.agent or agent_default} "
+        f"model={body.model or model_default} hitl={body.hitl} prompt={preview!r}",
         flush=True,
     )
 
@@ -274,12 +325,8 @@ async def chat_stream(body: ChatIn):
     config agent (agent serve dilarang memakai tool interaktif / effect
     "ask" — lihat opencode-core/), bukan di sini.
     """
-    session_id = body.session_id or await _create_session(
-        SessionIn(agent=body.agent, model=body.model)
-    )
-    if body.session_id:
-        await _sync_session_model(session_id, body.model)
-    _log_chat(body, session_id)
+    session_id, base, role, agent_default, model_default = await _ensure_session(body)
+    _log_chat(body, session_id, role, agent_default, model_default)
 
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
@@ -289,7 +336,7 @@ async def chat_stream(body: ChatIn):
         timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(base_url=BASE_URL, auth=AUTH, timeout=timeout) as client:
+            async with httpx.AsyncClient(base_url=base, auth=AUTH, timeout=timeout) as client:
                 async def abort_best_effort():
                     try:
                         await client.post(f"/api/session/{session_id}/abort", json={})
@@ -419,48 +466,53 @@ async def chat_stream(body: ChatIn):
 # serve tetap di backend, browser tidak pernah menyentuh password serve.
 
 @router.get("/sessions/{session_id}/forms")
-async def list_forms(session_id: str):
+async def list_forms(session_id: str, role: str = "public"):
     """Form pertanyaan agent yang masih tertunda di sesi ini."""
-    data = await _oc("GET", f"/api/session/{session_id}/form")
+    _, base, _, _ = _target(role)
+    data = await _oc("GET", f"/api/session/{session_id}/form", base=base)
     return {"status": "success", "forms": (data or {}).get("data", [])}
 
 
 @router.post("/sessions/{session_id}/forms/{form_id}/reply")
-async def reply_form(session_id: str, form_id: str, body: FormReplyIn):
+async def reply_form(session_id: str, form_id: str, body: FormReplyIn, role: str = "public"):
     """Jawab form agent; agent melanjutkan gilirannya sesudah ini."""
+    _, base, _, _ = _target(role)
     data = await _oc(
         "POST", f"/api/session/{session_id}/form/{form_id}/reply",
-        json={"answer": body.answer},
+        json={"answer": body.answer}, base=base,
     )
     print(f"[OPENCODE] HITL form dijawab session={session_id} form={form_id}", flush=True)
     return {"status": "success", "data": (data or {}).get("data")}
 
 
 @router.delete("/sessions/{session_id}/forms/{form_id}")
-async def cancel_form(session_id: str, form_id: str):
+async def cancel_form(session_id: str, form_id: str, role: str = "public"):
     """Batalkan form yang tertunda (agent menerima pembatalan)."""
-    await _oc("DELETE", f"/api/session/{session_id}/form/{form_id}")
+    _, base, _, _ = _target(role)
+    await _oc("DELETE", f"/api/session/{session_id}/form/{form_id}", base=base)
     return {"status": "success"}
 
 
 @router.get("/sessions/{session_id}/permissions")
-async def list_permissions(session_id: str):
+async def list_permissions(session_id: str, role: str = "public"):
     """Permintaan persetujuan aksi yang masih tertunda di sesi ini."""
-    data = await _oc("GET", f"/api/session/{session_id}/permission")
+    _, base, _, _ = _target(role)
+    data = await _oc("GET", f"/api/session/{session_id}/permission", base=base)
     return {"status": "success", "permissions": (data or {}).get("data", [])}
 
 
 @router.post("/sessions/{session_id}/permissions/{request_id}/reply")
-async def reply_permission(session_id: str, request_id: str, body: PermissionReplyIn):
+async def reply_permission(session_id: str, request_id: str, body: PermissionReplyIn, role: str = "public"):
     """Jawab permintaan persetujuan: once (sekali), always (selalu), reject (tolak)."""
     if body.decision not in ("once", "always", "reject"):
         raise HTTPException(status_code=422, detail="decision harus 'once', 'always', atau 'reject'")
+    _, base, _, _ = _target(role)
     payload: dict = {"decision": body.decision}
     if body.message:
         payload["message"] = body.message
     data = await _oc(
         "POST", f"/api/session/{session_id}/permission/{request_id}/reply",
-        json=payload,
+        json=payload, base=base,
     )
     print(f"[OPENCODE] HITL permission session={session_id} request={request_id} decision={body.decision}", flush=True)
     return {"status": "success", "data": (data or {}).get("data")}
