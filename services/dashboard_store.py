@@ -296,6 +296,11 @@ def init_dashboard_db() -> bool:
                 db.add(Integration(headers={}, **row))
             db.commit()
             print(f"[DASHBOARD] Tabel integrations dibuat + seed {len(_INTEGRATION_SEED)} integrasi infra.")
+        if db.query(AiProvider).count() == 0:
+            for row in _AI_PROVIDER_SEED:
+                db.add(AiProvider(**row))
+            db.commit()
+            print(f"[DASHBOARD] Tabel ai_providers dibuat + seed {len(_AI_PROVIDER_SEED)} provider AI.")
     finally:
         db.close()
     return True
@@ -475,6 +480,181 @@ def soft_delete_integration(db, i: Integration) -> None:
 def record_integration_test(db, i: Integration, ok: bool) -> None:
     i.last_tested_at = _now()
     i.last_test_ok = ok
+    db.commit()
+
+
+# ── Modul AI Providers (addendum spec 14 Nov 2026; dibangun 18 Nov) ──
+# Registry platform AI untuk agent opencode. API key TIDAK PERNAH
+# disimpan di sini — hanya NAMA env var (auth_env_var); nilai key hidup
+# di .env backend dan hanya dibaca saat test/publish. API hanya
+# mengembalikan boolean auth_env_present, tidak pernah nilainya.
+
+
+class AiProvider(Base):
+    __tablename__ = "ai_providers"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    provider_key = Column(String(100), nullable=False)
+    adapter = Column(String(30), nullable=False, default="openai-compatible")
+    package = Column(String(200), nullable=True)
+    base_url = Column(String(500), nullable=True)
+    auth_env_var = Column(String(200), nullable=True)
+    models = Column(JSON, nullable=False, default=list)
+    default_model = Column(String(300), nullable=True)
+    is_default = Column(Boolean, nullable=False, default=False)
+    status = Column(String(20), nullable=False, default="active")
+    notes = Column(Text, nullable=True)
+    last_tested_at = Column(DateTime(timezone=True), nullable=True)
+    last_test_ok = Column(Boolean, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+AI_PROVIDER_ADAPTERS = ("builtin", "openai-compatible")
+AI_PROVIDER_STATUSES = ("active", "inactive")
+
+# Seed awal: tiga platform yang SUDAH terdaftar di opencode-core dan
+# terbukti jalan lewat opencode (18 Nov 2026) — hanya saat tabel kosong.
+_AI_PROVIDER_SEED = [
+    {
+        "name": "Inception Labs (Mercury)",
+        "provider_key": "inception",
+        "adapter": "openai-compatible",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "base_url": "https://api.inceptionlabs.ai/v1",
+        "auth_env_var": "INCEPTION_API_KEY",
+        "models": [{"id": "mercury-3", "name": "Mercury 3"}],
+        "default_model": "mercury-3",
+        "is_default": True,
+        "notes": "Model agent publik saat ini. Config opencode-core juga menerima nama env MERCURY_API_KEY. Mercury berhenti total 28 Des 2026.",
+    },
+    {
+        "name": "Lyber",
+        "provider_key": "lyber",
+        "adapter": "openai-compatible",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "base_url": "https://api.lyber.ai/v1",
+        "auth_env_var": "LYBER_API_KEY",
+        "models": [{"id": "kimi-k31-pro-abliterated", "name": "Kimi K3.1 Pro Abliterated"}],
+        "default_model": "kimi-k31-pro-abliterated",
+        "is_default": False,
+        "notes": "Model agent admin (dashboard). Harga resmi $4/$0,40/$15 per 1 jt token (input/cached/output).",
+    },
+    {
+        "name": "AgentRouter",
+        "provider_key": "agentrouter",
+        "adapter": "openai-compatible",
+        "package": "@opencode/ai/providers/openai",
+        "base_url": "https://agentrouter.org/v1",
+        "auth_env_var": "AGENTROUTER_API_KEY",
+        "models": [
+            {"id": "gpt-6.1-sol", "name": "GPT 6.1 Sol"},
+            {"id": "gpt-5.6-sol", "name": "GPT 5.6 Sol"},
+        ],
+        "default_model": "gpt-6.1-sol",
+        "is_default": False,
+        "notes": "KHUSUS klien agent coding (opencode): tes koneksi generik di sini wajar 401 (client gating) walau chat lewat opencode terbukti jalan. Kandidat pengganti Mercury.",
+    },
+]
+
+
+def ai_provider_to_dict(p: AiProvider) -> dict:
+    """Bentuk API: tanpa nilai secret — hanya nama env var + boolean."""
+    env_name = p.auth_env_var or None
+    return {
+        "id": p.id,
+        "name": p.name,
+        "provider_key": p.provider_key,
+        "adapter": p.adapter,
+        "package": p.package,
+        "base_url": p.base_url,
+        "auth_env_var": env_name,
+        "auth_env_present": bool(env_name and os.getenv(env_name)),
+        "models": p.models or [],
+        "default_model": p.default_model,
+        "is_default": bool(p.is_default),
+        "status": p.status,
+        "notes": p.notes,
+        "last_tested_at": p.last_tested_at.isoformat() if p.last_tested_at else None,
+        "last_test_ok": p.last_test_ok,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+def list_ai_providers(db, status: str | None = None, q: str | None = None):
+    query = db.query(AiProvider).filter(AiProvider.deleted_at.is_(None))
+    if status:
+        query = query.filter(AiProvider.status == status)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (AiProvider.name.ilike(like))
+            | (AiProvider.provider_key.ilike(like))
+            | (AiProvider.base_url.ilike(like))
+        )
+    return query.order_by(AiProvider.is_default.desc(), AiProvider.updated_at.desc()).all()
+
+
+def get_ai_provider(db, provider_id: int):
+    return (
+        db.query(AiProvider)
+        .filter(AiProvider.id == provider_id, AiProvider.deleted_at.is_(None))
+        .first()
+    )
+
+
+def get_ai_provider_by_key(db, provider_key: str, exclude_id: int | None = None):
+    query = db.query(AiProvider).filter(
+        AiProvider.provider_key == provider_key, AiProvider.deleted_at.is_(None)
+    )
+    if exclude_id is not None:
+        query = query.filter(AiProvider.id != exclude_id)
+    return query.first()
+
+
+def _clear_default_ai_provider(db, except_id: int | None = None) -> None:
+    query = db.query(AiProvider).filter(
+        AiProvider.is_default.is_(True), AiProvider.deleted_at.is_(None)
+    )
+    if except_id is not None:
+        query = query.filter(AiProvider.id != except_id)
+    for other in query.all():
+        other.is_default = False
+
+
+def create_ai_provider(db, data: dict) -> AiProvider:
+    p = AiProvider(**data)
+    db.add(p)
+    db.flush()
+    if p.is_default:
+        _clear_default_ai_provider(db, except_id=p.id)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+def update_ai_provider(db, p: AiProvider, data: dict) -> AiProvider:
+    for key, value in data.items():
+        setattr(p, key, value)
+    if p.is_default:
+        _clear_default_ai_provider(db, except_id=p.id)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+def soft_delete_ai_provider(db, p: AiProvider) -> None:
+    p.deleted_at = _now()
+    p.is_default = False
+    db.commit()
+
+
+def record_ai_provider_test(db, p: AiProvider, ok: bool) -> None:
+    p.last_tested_at = _now()
+    p.last_test_ok = ok
     db.commit()
 
 

@@ -935,3 +935,233 @@ def dashboard_system(admin: str = Depends(require_admin)):
         "uptime_seconds": int(_time.time() - boot),
         "boot_time": _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(boot)),
     }
+
+
+# ── Modul AI Providers (addendum spec 14 Nov 2026; dibangun 18 Nov) ──
+# Registry platform AI ala halaman "API providers": CRUD base_url,
+# daftar model, model default. API key TIDAK PERNAH disimpan di DB —
+# yang disimpan hanya NAMA variabel di .env backend (auth_env_var);
+# API hanya mengembalikan boolean auth_env_present.
+
+_PROVIDER_KEY_RE = _re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+class AiModelIn(BaseModel):
+    id: str
+    name: str | None = None
+
+
+class AiProviderIn(BaseModel):
+    name: str
+    provider_key: str
+    adapter: Literal["builtin", "openai-compatible"] = "openai-compatible"
+    package: str | None = None
+    base_url: str | None = None
+    auth_env_var: str | None = None
+    models: list[AiModelIn] = []
+    default_model: str | None = None
+    is_default: bool = False
+    status: Literal["active", "inactive"] = "active"
+    notes: str | None = None
+
+
+def _ai_provider_or_404(db: Session, provider_id: int):
+    p = store.get_ai_provider(db, provider_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Provider AI tidak ditemukan.")
+    return p
+
+
+def _validate_ai_provider(payload: AiProviderIn, db: Session, exclude_id: int | None = None) -> dict:
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="Nama provider wajib diisi.")
+    key = payload.provider_key.strip()
+    if not _PROVIDER_KEY_RE.match(key):
+        raise HTTPException(
+            status_code=422,
+            detail="provider_key harus slug huruf kecil/angka, boleh '-' dan '_' (mis. 'openrouter').",
+        )
+    if store.get_ai_provider_by_key(db, key, exclude_id=exclude_id) is not None:
+        raise HTTPException(status_code=409, detail=f"provider_key '{key}' sudah dipakai provider lain.")
+    base_url = (payload.base_url or "").strip() or None
+    if payload.adapter == "openai-compatible":
+        if not base_url:
+            raise HTTPException(status_code=422, detail="base_url wajib untuk adapter openai-compatible.")
+        if not (payload.package or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail="package wajib untuk adapter openai-compatible (mis. '@opencode/ai/providers/openai-compatible').",
+            )
+    if base_url:
+        parsed = _urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise HTTPException(status_code=422, detail="base_url harus URL http(s) yang valid.")
+    env_name = (payload.auth_env_var or "").strip() or None
+    if env_name and not _ENV_NAME_RE.match(env_name):
+        raise HTTPException(
+            status_code=422,
+            detail="auth_env_var harus nama variabel environment yang valid (huruf/angka/garis bawah).",
+        )
+    models: list[dict] = []
+    seen: set[str] = set()
+    for m in payload.models or []:
+        mid = (m.id or "").strip()
+        if not mid:
+            raise HTTPException(status_code=422, detail="Setiap model wajib punya id non-kosong.")
+        if mid in seen:
+            raise HTTPException(status_code=422, detail=f"Model '{mid}' duplikat dalam satu provider.")
+        seen.add(mid)
+        models.append({"id": mid, "name": (m.name or "").strip() or mid})
+    default_model = (payload.default_model or "").strip() or None
+    if default_model and default_model not in seen:
+        raise HTTPException(status_code=422, detail="default_model harus salah satu id di daftar models.")
+    data = payload.model_dump()
+    data.update(
+        {
+            "name": payload.name.strip(),
+            "provider_key": key,
+            "package": (payload.package or "").strip() or None,
+            "base_url": base_url,
+            "auth_env_var": env_name,
+            "models": models,
+            "default_model": default_model,
+            "notes": (payload.notes or "").strip() or None,
+        }
+    )
+    return data
+
+
+@router.get("/ai-providers")
+async def list_ai_providers(
+    status: str | None = None,
+    q: str | None = None,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_ai_providers(db, status=status, q=q)
+    return {"items": [store.ai_provider_to_dict(p) for p in rows], "total": len(rows)}
+
+
+@router.post("/ai-providers", status_code=201)
+async def create_ai_provider(
+    payload: AiProviderIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    data = _validate_ai_provider(payload, db)
+    return store.ai_provider_to_dict(store.create_ai_provider(db, data))
+
+
+@router.get("/ai-providers/{provider_id}")
+async def get_ai_provider(
+    provider_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    return store.ai_provider_to_dict(_ai_provider_or_404(db, provider_id))
+
+
+@router.put("/ai-providers/{provider_id}")
+async def update_ai_provider(
+    provider_id: int,
+    payload: AiProviderIn,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    p = _ai_provider_or_404(db, provider_id)
+    data = _validate_ai_provider(payload, db, exclude_id=provider_id)
+    return store.ai_provider_to_dict(store.update_ai_provider(db, p, data))
+
+
+@router.delete("/ai-providers/{provider_id}")
+async def delete_ai_provider(
+    provider_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    p = _ai_provider_or_404(db, provider_id)
+    store.soft_delete_ai_provider(db, p)
+    return {"ok": True, "deleted_id": provider_id}
+
+
+@router.post("/ai-providers/{provider_id}/test")
+async def test_ai_provider(
+    provider_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    """Tes koneksi: builtin = provider_key ada di katalog serve;
+    openai-compatible = GET {base_url}/models (Bearer dari env bila
+    auth_env_var terisi). Hasil dicatat ke last_tested_at/last_test_ok."""
+    p = _ai_provider_or_404(db, provider_id)
+    start = time.perf_counter()
+
+    def _latency() -> int:
+        return int((time.perf_counter() - start) * 1000)
+
+    if p.adapter == "builtin":
+        base = os.getenv("OPENCODE_ADMIN_BASE_URL") or os.getenv(
+            "OPENCODE_BASE_URL", "http://127.0.0.1:4096"
+        )
+        password = os.getenv("OPENCODE_SERVER_PASSWORD", "")
+        auth = ("opencode", password) if password else None
+        try:
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(base.rstrip("/") + "/api/model", auth=auth)
+            if resp.status_code >= 400:
+                store.record_ai_provider_test(db, p, False)
+                return {
+                    "ok": False,
+                    "status_code": resp.status_code,
+                    "latency_ms": _latency(),
+                    "error": f"Serve opencode menjawab HTTP {resp.status_code}.",
+                }
+            ids = {(m or {}).get("providerID") for m in (resp.json().get("data") or [])}
+            ok = p.provider_key in ids
+            store.record_ai_provider_test(db, p, ok)
+            return {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "latency_ms": _latency(),
+                "error": None if ok else f"Provider '{p.provider_key}' tidak ada di katalog serve.",
+            }
+        except Exception as e:
+            store.record_ai_provider_test(db, p, False)
+            return {
+                "ok": False,
+                "status_code": None,
+                "latency_ms": _latency(),
+                "error": _mask_secrets(str(e))[:200] or "Serve opencode tidak terjangkau.",
+            }
+
+    headers: dict = {}
+    if p.auth_env_var:
+        value = os.getenv(p.auth_env_var)
+        if not value:
+            store.record_ai_provider_test(db, p, False)
+            return {
+                "ok": False,
+                "status_code": None,
+                "latency_ms": None,
+                "error": f"Env var {p.auth_env_var} tidak terisi di environment backend.",
+            }
+        headers["Authorization"] = f"Bearer {value}"
+    try:
+        async with _httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(p.base_url.rstrip("/") + "/models", headers=headers)
+        ok = resp.status_code < 400
+        store.record_ai_provider_test(db, p, ok)
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "latency_ms": _latency(),
+            "error": None if ok else f"Server menjawab HTTP {resp.status_code}.",
+        }
+    except Exception as e:
+        store.record_ai_provider_test(db, p, False)
+        return {
+            "ok": False,
+            "status_code": None,
+            "latency_ms": _latency(),
+            "error": _mask_secrets(str(e))[:200] or "Koneksi gagal.",
+        }
