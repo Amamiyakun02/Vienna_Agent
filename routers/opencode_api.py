@@ -553,9 +553,24 @@ async def list_forms(session_id: str, role: str = "public"):
 async def reply_form(session_id: str, form_id: str, body: FormReplyIn, role: str = "public"):
     """Jawab form agent; agent melanjutkan gilirannya sesudah ini."""
     _, base, _, _ = _target(role)
+    answer = dict(body.answer)
+    # Normalisasi bentuk jawaban per tipe field: serve menolak scalar
+    # untuk field multiselect ("Expected string array for form field")
+    # — bentuk yang benar adalah urusan kontrak backend<->serve,
+    # bukan beban klien. Gagal membaca form tidak menggagalkan jawaban.
+    try:
+        forms = await _oc("GET", f"/api/session/{session_id}/form", base=base)
+        form = next((f for f in (forms or {}).get("data", []) if f.get("id") == form_id), None)
+        if form:
+            for field in form.get("fields") or []:
+                key = field.get("key")
+                if field.get("type") == "multiselect" and key in answer and not isinstance(answer[key], list):
+                    answer[key] = [answer[key]]
+    except HTTPException:
+        pass
     data = await _oc(
         "POST", f"/api/session/{session_id}/form/{form_id}/reply",
-        json={"answer": body.answer}, base=base,
+        json={"answer": answer}, base=base,
     )
     print(f"[OPENCODE] HITL form dijawab session={session_id} form={form_id}", flush=True)
     return {"status": "success", "data": (data or {}).get("data")}
