@@ -32,7 +32,7 @@ import os
 import time
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -87,11 +87,68 @@ def _target(role: str | None) -> tuple[str, str, str, str]:
     """(role, base_url, agent_default, model_default) untuk satu role.
 
     Default SELALU publik (hak paling kecil); admin hanya bila diminta
-    persis "admin" — pemilihnya nanti digerbang auth dashboard.
+    persis "admin" — dan role admin digerbang _admin_gate di bawah.
     """
     if (role or "").strip().lower() == "admin":
         return "admin", ADMIN_BASE_URL, ADMIN_AGENT, ADMIN_MODEL
     return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, _db_model_default() or DEFAULT_MODEL
+
+
+def _admin_gate(role: str | None, x_admin_token: str | None) -> str | None:
+    """Gerbang role admin: wajib token dashboard yang valid.
+
+    Instance admin nyaris setara akses server — ia tidak boleh bisa
+    dipanggil siapa pun yang sekadar bisa mencapai backend. Verifikasi
+    memakai fungsi yang sama persis dengan gerbang dashboard
+    (token HMAC 12 jam, header X-Admin-Token). Mengembalikan username
+    admin (untuk audit) bila role admin; None untuk role publik.
+    """
+    if (role or "").strip().lower() != "admin":
+        return None
+    from routers.dashboard_api import _verify_token
+
+    user = _verify_token(x_admin_token)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Role admin butuh token dashboard yang valid (header X-Admin-Token).",
+        )
+    return user
+
+
+def _record_turn(
+    session_id: str,
+    role: str,
+    agent: str | None,
+    model: str | None,
+    admin_user: str | None,
+    prompt: str,
+    usage: dict | None,
+    tools: list[str],
+) -> None:
+    """Catat metadata sesi ke tabel ai_sessions (audit dashboard).
+
+    Best-effort: fungsi store-nya sendiri tidak pernah melempar, dan
+    pemanggil membungkusnya lagi — pencatatan tidak boleh mengganggu
+    percakapan. usage adalah {cost, tokens} KUMULATIF dari serve.
+    """
+    try:
+        from services import dashboard_store as _store
+
+        usage = usage or {}
+        _store.record_ai_session_turn(
+            session_id=session_id,
+            role=role,
+            agent=agent,
+            model=model,
+            admin_user=admin_user,
+            prompt=prompt,
+            total_tokens=_tokens_total(usage.get("tokens")),
+            total_cost=usage.get("cost") or 0.0,
+            tools=tools,
+        )
+    except Exception:
+        pass
 
 
 async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, **kwargs):
@@ -259,10 +316,11 @@ async def status():
 
 
 @router.get("/models")
-async def list_models(role: str = "public"):
+async def list_models(role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Katalog model satu instance opencode-core (?role=public|admin),
     dikelompokkan per provider. Model bisa dipilih lewat field "model"
     ("providerID/modelID") pada POST /chat."""
+    _admin_gate(role, x_admin_token)
     _, base, _, model_default = _target(role)
     data = await _oc("GET", "/api/model", base=base)
     providers: dict[str, list[str]] = {}
@@ -277,7 +335,8 @@ async def list_models(role: str = "public"):
 
 
 @router.get("/sessions")
-async def list_sessions(role: str = "public"):
+async def list_sessions(role: str = "public", x_admin_token: str | None = Header(default=None)):
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", "/api/session", base=base)
     sessions = [
@@ -288,27 +347,30 @@ async def list_sessions(role: str = "public"):
 
 
 @router.post("/sessions")
-async def create_session(body: SessionIn, role: str = "public"):
+async def create_session(body: SessionIn, role: str = "public", x_admin_token: str | None = Header(default=None)):
+    _admin_gate(role, x_admin_token)
     _, base, agent_default, model_default = _target(role)
     session_id = await _create_session(body, base, agent_default, model_default)
     return {"status": "success", "session_id": session_id}
 
 
 @router.get("/sessions/{session_id}/messages")
-async def session_messages(session_id: str, role: str = "public"):
+async def session_messages(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", f"/api/session/{session_id}/message", base=base)
     return {"status": "success", "messages": (data or {}).get("data", [])}
 
 
 @router.post("/chat")
-async def chat(body: ChatIn):
+async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     """Kirim prompt ke agent opencode dan tunggu jawaban finalnya.
 
     Sesi & riwayat disimpan opencode sendiri (bukan Mongo backend) —
     itulah inti memakai harness-nya. Lanjutkan percakapan dengan
     mengembalikan session_id dari respons ke permintaan berikutnya.
     """
+    admin_user = _admin_gate(body.role, x_admin_token)
     session_id, base, role, agent_default, model_default, session_data = await _ensure_session(body)
     _log_chat(body, session_id, role, agent_default, model_default)
     if role == "public":
@@ -345,6 +407,17 @@ async def chat(body: ChatIn):
     tools = [p.get("name") for m in turn for p in (m.get("content") or []) if p.get("type") == "tool"]
     model = (assistant.get("model") or {}).get("id")
     print(f"[OPENCODE] selesai session={session_id} model={model} tools={tools}", flush=True)
+    usage = None
+    try:
+        sdata = await _oc("GET", f"/api/session/{session_id}", timeout=10.0, base=base)
+        sd = (sdata or {}).get("data") or {}
+        usage = {"cost": sd.get("cost"), "tokens": sd.get("tokens")}
+    except Exception:
+        pass
+    _record_turn(
+        session_id, role, assistant.get("agent") or (body.agent or agent_default),
+        model, admin_user, body.prompt, usage, tools,
+    )
     return {
         "status": "success",
         "session_id": session_id,
@@ -372,7 +445,7 @@ def _log_chat(body: ChatIn, session_id: str, role: str, agent_default: str, mode
 
 
 @router.post("/chat/stream")
-async def chat_stream(body: ChatIn):
+async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     """Versi streaming dari /chat: teks tampil per potongan (SSE).
 
     Berlangganan GET /api/event DULU, baru kirim prompt, supaya tidak
@@ -391,6 +464,7 @@ async def chat_stream(body: ChatIn):
     config agent (agent serve dilarang memakai tool interaktif / effect
     "ask" — lihat opencode-core/), bukan di sini.
     """
+    admin_user = _admin_gate(body.role, x_admin_token)
     session_id, base, role, agent_default, model_default, session_data = await _ensure_session(body)
     _log_chat(body, session_id, role, agent_default, model_default)
     if role == "public":
@@ -535,6 +609,10 @@ async def chat_stream(body: ChatIn):
             f"tools={tools_used} durasi={time.monotonic() - started:.1f}dtk",
             flush=True,
         )
+        _record_turn(
+            session_id, role, body.agent or agent_default, model_id,
+            admin_user, body.prompt, usage, tools_used,
+        )
         yield _sse({
             "done": True,
             "session_id": session_id,
@@ -556,16 +634,18 @@ async def chat_stream(body: ChatIn):
 # serve tetap di backend, browser tidak pernah menyentuh password serve.
 
 @router.get("/sessions/{session_id}/forms")
-async def list_forms(session_id: str, role: str = "public"):
+async def list_forms(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Form pertanyaan agent yang masih tertunda di sesi ini."""
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", f"/api/session/{session_id}/form", base=base)
     return {"status": "success", "forms": (data or {}).get("data", [])}
 
 
 @router.post("/sessions/{session_id}/forms/{form_id}/reply")
-async def reply_form(session_id: str, form_id: str, body: FormReplyIn, role: str = "public"):
+async def reply_form(session_id: str, form_id: str, body: FormReplyIn, role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Jawab form agent; agent melanjutkan gilirannya sesudah ini."""
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     answer = dict(body.answer)
     # Normalisasi bentuk jawaban per tipe field: serve menolak scalar
@@ -591,24 +671,27 @@ async def reply_form(session_id: str, form_id: str, body: FormReplyIn, role: str
 
 
 @router.delete("/sessions/{session_id}/forms/{form_id}")
-async def cancel_form(session_id: str, form_id: str, role: str = "public"):
+async def cancel_form(session_id: str, form_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Batalkan form yang tertunda (agent menerima pembatalan)."""
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     await _oc("DELETE", f"/api/session/{session_id}/form/{form_id}", base=base)
     return {"status": "success"}
 
 
 @router.get("/sessions/{session_id}/permissions")
-async def list_permissions(session_id: str, role: str = "public"):
+async def list_permissions(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Permintaan persetujuan aksi yang masih tertunda di sesi ini."""
+    _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", f"/api/session/{session_id}/permission", base=base)
     return {"status": "success", "permissions": (data or {}).get("data", [])}
 
 
 @router.post("/sessions/{session_id}/permissions/{request_id}/reply")
-async def reply_permission(session_id: str, request_id: str, body: PermissionReplyIn, role: str = "public"):
+async def reply_permission(session_id: str, request_id: str, body: PermissionReplyIn, role: str = "public", x_admin_token: str | None = Header(default=None)):
     """Jawab permintaan persetujuan: once (sekali), always (selalu), reject (tolak)."""
+    _admin_gate(role, x_admin_token)
     if body.decision not in ("once", "always", "reject"):
         raise HTTPException(status_code=422, detail="decision harus 'once', 'always', atau 'reject'")
     _, base, _, _ = _target(role)

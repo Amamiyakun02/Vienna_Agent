@@ -1337,3 +1337,46 @@ async def publish_ai_providers(
             "Sesi publik yang sudah berjalan ikut pindah model pada pesan berikutnya lewat router."
         ),
     }
+
+
+# ── Modul AI Agent: daftar sesi opencode (metadata + audit) ──
+# Baris di tabel ai_sessions ditulis router opencode tiap giliran
+# selesai; di sini hanya dibaca/dihapus. Transkrip lengkap tetap
+# diambil dari serve lewat GET /v1/opencode/sessions/{id}/messages
+# (role admin di sana juga tergerbang token yang sama).
+
+
+@router.get("/ai-sessions")
+async def list_ai_sessions(
+    role: str | None = None,
+    q: str | None = None,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    rows = store.list_ai_sessions(db, role=role, q=q)
+    return {"items": [store.ai_session_to_dict(s) for s in rows], "total": len(rows)}
+
+
+@router.get("/ai-sessions/{row_id}")
+async def get_ai_session(
+    row_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    s = store.get_ai_session(db, row_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan.")
+    return store.ai_session_to_dict(s)
+
+
+@router.delete("/ai-sessions/{row_id}")
+async def delete_ai_session(
+    row_id: int,
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    s = store.get_ai_session(db, row_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan.")
+    store.soft_delete_ai_session(db, s)
+    return {"ok": True, "deleted_id": row_id}

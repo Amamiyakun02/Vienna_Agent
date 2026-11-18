@@ -17,6 +17,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -685,6 +686,146 @@ def default_ai_model_ref() -> str | None:
         return None
     finally:
         db.close()
+
+
+# ── Modul AI Agent: metadata sesi opencode (audit) ──
+# Transkrip lengkap TIDAK disalin ke sini — itu milik opencode serve
+# (SQLite-nya sendiri). Tabel ini hanya metadata per sesi agar
+# dashboard bisa menampilkan daftar sesi + jejak audit ringkas: siapa
+# (admin_user untuk role admin), agent/model apa, berapa prompt,
+# berapa token/biaya kumulatif, dan prompt pertama/terakhir. Diisi
+# router opencode setiap giliran chat selesai (best-effort — kegagalan
+# pencatatan tidak boleh menggagalkan chat).
+
+
+class AiSession(Base):
+    __tablename__ = "ai_sessions"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(20), nullable=False, default="public")
+    agent = Column(String(100), nullable=True)
+    model = Column(String(300), nullable=True)
+    admin_user = Column(String(100), nullable=True)
+    first_prompt = Column(Text, nullable=True)
+    last_prompt = Column(Text, nullable=True)
+    prompt_count = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    total_cost = Column(Float, nullable=False, default=0.0)
+    tools_used = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+def ai_session_to_dict(s: AiSession) -> dict:
+    return {
+        "id": s.id,
+        "session_id": s.session_id,
+        "role": s.role,
+        "agent": s.agent,
+        "model": s.model,
+        "admin_user": s.admin_user,
+        "first_prompt": s.first_prompt,
+        "last_prompt": s.last_prompt,
+        "prompt_count": s.prompt_count,
+        "total_tokens": s.total_tokens,
+        "total_cost": s.total_cost,
+        "tools_used": s.tools_used or [],
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
+def record_ai_session_turn(
+    session_id: str,
+    role: str,
+    agent: str | None,
+    model: str | None,
+    admin_user: str | None,
+    prompt: str,
+    total_tokens: int,
+    total_cost: float,
+    tools: list[str],
+) -> None:
+    """Upsert metadata satu sesi sesudah satu giliran chat selesai.
+
+    total_tokens/total_cost dari serve bersifat KUMULATIF per sesi,
+    jadi disimpan apa adanya (bukan ditambah). Fungsi ini membuka
+    sesinya sendiri dan TIDAK PERNAH melempar — pencatatan audit
+    tidak boleh mengganggu percakapan.
+    """
+    if not session_id or _get_engine() is None:
+        return
+    db = _Session()
+    try:
+        s = (
+            db.query(AiSession)
+            .filter(AiSession.session_id == session_id, AiSession.deleted_at.is_(None))
+            .first()
+        )
+        snippet = " ".join((prompt or "").split())[:1000] or None
+        if s is None:
+            s = AiSession(
+                session_id=session_id,
+                role=role or "public",
+                agent=agent,
+                model=model,
+                admin_user=admin_user,
+                first_prompt=snippet,
+                prompt_count=0,
+                tools_used=[],
+            )
+            db.add(s)
+        s.last_prompt = snippet
+        s.prompt_count = (s.prompt_count or 0) + 1
+        if agent:
+            s.agent = agent
+        if model:
+            s.model = model
+        if admin_user:
+            s.admin_user = admin_user
+        s.total_tokens = int(total_tokens or 0)
+        s.total_cost = float(total_cost or 0.0)
+        merged = list(s.tools_used or [])
+        for t in tools or []:
+            if t and t not in merged:
+                merged.append(t)
+        s.tools_used = merged
+        s.updated_at = _now()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def list_ai_sessions(db, role: str | None = None, q: str | None = None):
+    query = db.query(AiSession).filter(AiSession.deleted_at.is_(None))
+    if role:
+        query = query.filter(AiSession.role == role)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (AiSession.session_id.like(like))
+            | (AiSession.first_prompt.like(like))
+            | (AiSession.last_prompt.like(like))
+            | (AiSession.admin_user.like(like))
+        )
+    return query.order_by(AiSession.updated_at.desc()).all()
+
+
+def get_ai_session(db, row_id: int):
+    return (
+        db.query(AiSession)
+        .filter(AiSession.id == row_id, AiSession.deleted_at.is_(None))
+        .first()
+    )
+
+
+def soft_delete_ai_session(db, s: AiSession) -> None:
+    s.deleted_at = _now()
+    db.commit()
 
 
 # ── Modul 5: Users (spec §7; diskusi skema 8 Nov 2026) ──
