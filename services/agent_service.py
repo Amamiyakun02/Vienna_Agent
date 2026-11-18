@@ -924,15 +924,6 @@ LYBER_MAX_COMPLETION_TOKENS = int(os.getenv("LYBER_MAX_COMPLETION_TOKENS", "8192
 LYBER_TIMEOUT_S = float(os.getenv("LYBER_TIMEOUT_S", "120"))
 LYBER_MAX_STEPS = max(1, int(os.getenv("LYBER_MAX_STEPS", "8")))
 
-# AgentRouter (OpenAI-compatible) — model umum via https://agentrouter.org/v1.
-# Latensi layanan lambat (TTFT P90 ±45 dtk per statistik user), timeout longgar.
-AGENTROUTER_BASE_URL = (os.getenv("AGENTROUTER_BASE_URL") or "https://agentrouter.org/v1").strip().rstrip("/")
-AGENTROUTER_MODEL = os.getenv("AGENTROUTER_MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol"
-AGENTROUTER_FALLBACK_MODEL = os.getenv("AGENTROUTER_FALLBACK_MODEL", "").strip()
-AGENTROUTER_MAX_COMPLETION_TOKENS = int(os.getenv("AGENTROUTER_MAX_COMPLETION_TOKENS", "8192"))
-AGENTROUTER_TIMEOUT_S = float(os.getenv("AGENTROUTER_TIMEOUT_S", "180"))
-AGENTROUTER_MAX_STEPS = max(1, int(os.getenv("AGENTROUTER_MAX_STEPS", "8")))
-
 
 def _mercury_api_key() -> str:
     """MERCURY_API_KEY diutamakan; INCEPTION_API_KEY didukung (nama resmi SDK)."""
@@ -1358,38 +1349,6 @@ class LyberAgentEngine(MercuryAgentEngine):
     log_label = "LYBER"
     missing_key_message = (
         "Lyber belum dikonfigurasi: isi LYBER_API_KEY di environment."
-    )
-
-    def __init__(self, persona_file="agents/vienna.json"):
-        super().__init__(persona_file=persona_file)
-
-
-class AgentRouterAgentEngine(MercuryAgentEngine):
-    """Engine model umum melalui AgentRouter (API OpenAI-compatible).
-
-    Base URL OpenAI-compatible https://agentrouter.org/v1 untuk model umum;
-    model default gpt-6.1-sol, ganti lewat AGENTROUTER_MODEL. (Model Claude
-    Opus di layanan ini memakai jalur Anthropic https://agentrouter.org —
-    tidak dipakai engine ini.) Latensi layanan lambat, timeout 180 detik.
-    """
-
-    provider = "agentrouter"
-    api_key_envs = ("AGENTROUTER_API_KEY",)
-    base_url = AGENTROUTER_BASE_URL
-    primary_model = AGENTROUTER_MODEL
-    fallback_model = AGENTROUTER_FALLBACK_MODEL
-    max_completion_tokens = AGENTROUTER_MAX_COMPLETION_TOKENS
-    timeout_s = AGENTROUTER_TIMEOUT_S
-    max_steps = AGENTROUTER_MAX_STEPS
-    stream_reasoning = False
-    reasoning_effort = ""
-    temperature_env = "AGENTROUTER_TEMPERATURE"
-    temperature_min = 0.0
-    temperature_max = 2.0
-    temperature_default = 0.75
-    log_label = "AGENTROUTER"
-    missing_key_message = (
-        "AgentRouter belum dikonfigurasi: isi AGENTROUTER_API_KEY di environment."
     )
 
     def __init__(self, persona_file="agents/vienna.json"):

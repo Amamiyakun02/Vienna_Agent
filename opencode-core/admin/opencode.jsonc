@@ -39,6 +39,23 @@
           "limit": { "context": 128000, "output": 8192 }
         }
       }
+    },
+    "agentrouter": {
+      "name": "AgentRouter",
+      "env": ["AGENTROUTER_API_KEY"],
+      // BUKAN openai-compatible: model GPT di AgentRouter hanya bicara
+      // Responses API, dan layanannya hanya menerima klien agent coding
+      // (opencode LOLOS - terbukti chat live 18 Nov 2026, 5,8 dtk).
+      // Backend FastAPI TIDAK bisa memakai key ini (client gating +
+      // protokol beda); jalur resminya memang lewat opencode.
+      "package": "@opencode/ai/providers/openai",
+      "settings": { "baseURL": "https://agentrouter.org/v1" },
+      "models": {
+        "gpt-6.1-sol": {
+          "name": "GPT 6.1 Sol (AgentRouter)",
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
     }
   },
 
