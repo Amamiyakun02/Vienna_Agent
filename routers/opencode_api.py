@@ -56,6 +56,15 @@ ADMIN_AGENT = os.getenv("OPENCODE_ADMIN_AGENT", "admin")
 # kuota bersamanya bisa habis sewaktu-waktu). Ganti lewat env OPENCODE_MODEL.
 DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "").strip() or "inception/mercury-3"  # format "providerID/modelID"
 ADMIN_MODEL = os.getenv("OPENCODE_ADMIN_MODEL", "").strip() or "lyber/kimi-k31-pro-abliterated"
+# Limit khusus role publik (anonim) — menahan pemborosan token saat
+# diekspos ke internet. Acuan ukuran: satu giliran tanya-jawab profil
+# normal ≈ 10,5 ribu token (input ±9 ribu: system + instruksi + katalog
+# tool MCP ikut terkirim tiap giliran) dan ±$0,0013. Semua bisa diatur
+# via env; 0 = nonaktif.
+PUBLIC_MAX_PROMPT_CHARS = int(os.getenv("OPENCODE_PUBLIC_MAX_PROMPT_CHARS", "4000"))
+PUBLIC_MAX_TURNS = int(os.getenv("OPENCODE_PUBLIC_MAX_TURNS", "30"))
+PUBLIC_MAX_SESSION_TOKENS = int(os.getenv("OPENCODE_PUBLIC_MAX_SESSION_TOKENS", "250000"))
+PUBLIC_MAX_TURN_TOKENS = int(os.getenv("OPENCODE_PUBLIC_MAX_TURN_TOKENS", "80000"))
 TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
@@ -149,29 +158,67 @@ async def _sync_session_model(session_id: str, model: str | None, base: str, mod
         pass
 
 
-async def _ensure_session(body: ChatIn) -> tuple[str, str, str, str, str]:
-    """(session_id, base, role, agent_default, model_default) untuk chat.
+def _tokens_total(tokens: dict | None) -> int:
+    """Total token dari objek tokens serve (input+output+reasoning+cache).
+
+    Token cache ikut dihitung penuh: provider memang menagihnya lebih
+    murah, tetapi limit ini soal total konsumsi sesi/giliran — dan tanpa
+    cache pun angka inilah yang benar-benar diproses model.
+    """
+    t = tokens or {}
+    cache = t.get("cache") or {}
+    return (
+        int(t.get("input") or 0)
+        + int(t.get("output") or 0)
+        + int(t.get("reasoning") or 0)
+        + int(cache.get("read") or 0)
+        + int(cache.get("write") or 0)
+    )
+
+
+async def _ensure_session(body: ChatIn) -> tuple[str, str, str, str, str, dict | None]:
+    """(session_id, base, role, agent_default, model_default, session_data).
 
     Sesi baru dibuat di instance sesuai role. Sesi lama dipakai ulang
-    (modelnya disamakan); sesi lama yang TIDAK dikenal instance tujuan
-    — mis. dibuat di serve pribadi sebelum isolasi — diganti sesi baru
-    diam-diam supaya klien tidak nyangkut pada id yang yatim.
+    (modelnya disamakan; session_data-nya dikembalikan untuk cek limit);
+    sesi lama yang TIDAK dikenal instance tujuan — mis. dibuat di serve
+    pribadi sebelum isolasi — diganti sesi baru diam-diam supaya klien
+    tidak nyangkut pada id yang yatim.
     """
     role, base, agent_default, model_default = _target(body.role)
     if body.session_id:
         try:
-            await _oc("GET", f"/api/session/{body.session_id}", timeout=10.0, base=base)
+            data = await _oc("GET", f"/api/session/{body.session_id}", timeout=10.0, base=base)
         except HTTPException:
             sid = await _create_session(
                 SessionIn(agent=body.agent, model=body.model), base, agent_default, model_default
             )
-            return sid, base, role, agent_default, model_default
+            return sid, base, role, agent_default, model_default, None
         await _sync_session_model(body.session_id, body.model, base, model_default)
-        return body.session_id, base, role, agent_default, model_default
+        return body.session_id, base, role, agent_default, model_default, (data or {}).get("data")
     sid = await _create_session(
         SessionIn(agent=body.agent, model=body.model), base, agent_default, model_default
     )
-    return sid, base, role, agent_default, model_default
+    return sid, base, role, agent_default, model_default, None
+
+
+async def _public_limit_error(body: ChatIn, base: str, session_id: str, session_data: dict | None) -> str | None:
+    """Pesan penolakan bila limit role publik tercapai; None bila aman.
+
+    Hanya dipanggil untuk role publik — admin (user sendiri) tak dibatasi.
+    """
+    if PUBLIC_MAX_PROMPT_CHARS and len(body.prompt) > PUBLIC_MAX_PROMPT_CHARS:
+        return f"Pesan terlalu panjang (maksimal {PUBLIC_MAX_PROMPT_CHARS} karakter). Persingkat lalu coba lagi."
+    if session_data is None:
+        return None  # sesi baru: belum ada pemakaian
+    if PUBLIC_MAX_SESSION_TOKENS and _tokens_total(session_data.get("tokens")) >= PUBLIC_MAX_SESSION_TOKENS:
+        return "Sesi ini sudah mencapai batas pemakaian. Silakan mulai sesi baru."
+    if PUBLIC_MAX_TURNS:
+        data = await _oc("GET", f"/api/session/{session_id}/message", timeout=10.0, base=base)
+        turns = sum(1 for m in (data or {}).get("data", []) if m.get("type") == "user")
+        if turns >= PUBLIC_MAX_TURNS:
+            return "Sesi ini sudah mencapai batas jumlah pesan. Silakan mulai sesi baru."
+    return None
 
 
 @router.get("/status")
@@ -248,8 +295,13 @@ async def chat(body: ChatIn):
     itulah inti memakai harness-nya. Lanjutkan percakapan dengan
     mengembalikan session_id dari respons ke permintaan berikutnya.
     """
-    session_id, base, role, agent_default, model_default = await _ensure_session(body)
+    session_id, base, role, agent_default, model_default, session_data = await _ensure_session(body)
     _log_chat(body, session_id, role, agent_default, model_default)
+    if role == "public":
+        limit_error = await _public_limit_error(body, base, session_id, session_data)
+        if limit_error:
+            print(f"[OPENCODE] limit publik session={session_id}: {limit_error}", flush=True)
+            return {"status": "error", "session_id": session_id, "response": "", "error": limit_error}
     await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt}, base=base)
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
@@ -325,8 +377,23 @@ async def chat_stream(body: ChatIn):
     config agent (agent serve dilarang memakai tool interaktif / effect
     "ask" — lihat opencode-core/), bukan di sini.
     """
-    session_id, base, role, agent_default, model_default = await _ensure_session(body)
+    session_id, base, role, agent_default, model_default, session_data = await _ensure_session(body)
     _log_chat(body, session_id, role, agent_default, model_default)
+    if role == "public":
+        limit_error = await _public_limit_error(body, base, session_id, session_data)
+        if limit_error:
+            print(f"[OPENCODE] limit publik session={session_id}: {limit_error}", flush=True)
+
+            async def limit_gen():
+                yield _sse({"meta": {"session_id": session_id}})
+                yield _sse({"error": limit_error})
+
+            return StreamingResponse(
+                limit_gen(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+    turn_start_tokens = _tokens_total((session_data or {}).get("tokens")) if session_data else 0
 
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
@@ -426,6 +493,15 @@ async def chat_stream(body: ChatIn):
                                 model_id = (data.get("model") or {}).get("id") or model_id
                             elif etype == "session.usage.updated":
                                 usage = {"cost": data.get("cost"), "tokens": data.get("tokens")}
+                                if (
+                                    role == "public"
+                                    and PUBLIC_MAX_TURN_TOKENS
+                                    and _tokens_total(data.get("tokens")) - turn_start_tokens > PUBLIC_MAX_TURN_TOKENS
+                                ):
+                                    await abort_best_effort()
+                                    print(f"[OPENCODE] limit per giliran session={session_id}", flush=True)
+                                    yield _sse({"error": "Giliran ini dihentikan: pemakaian token melebihi batas per giliran. Persingkat permintaanmu."})
+                                    return
                             elif etype == "session.execution.succeeded":
                                 break
                             elif etype == "session.execution.failed":
