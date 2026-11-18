@@ -26,8 +26,10 @@ keluaran meniru SSE process_chat: {"text": ...} per potongan,
 {"error": ...} bila gagal.
 """
 
+import asyncio
 import json
 import os
+import time
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -213,6 +215,18 @@ async def chat_stream(body: ChatIn):
     Berlangganan GET /api/event DULU, baru kirim prompt, supaya tidak
     ada delta awal yang terlewat. Aliran event serve itu global (semua
     sesi) — disaring di sini berdasarkan sessionID sesi ini.
+
+    Ketahanan aliran (pelajaran insiden 18 Nov 2026): agent pribadi
+    memakai tool interaktif "question" yang menunggu jawaban manusia —
+    di serve headless jawaban itu tidak pernah datang, eksekusi macet
+    tanpa event apa pun, dan aliran SSE mati diputus proxy/browser
+    (ERR_INCOMPLETE_CHUNKED_ENCODING di frontend). Karena itu generator
+    ini: (1) mengirim heartbeat komentar SSE tiap 15 dtk senyap supaya
+    proxy tidak memutus aliran yang sah, (2) punya tenggat total
+    TIMEOUT_S lalu menutup dengan event error yang rapi, (3) menghentikan
+    giliran seketika bila tool "question" muncul. Obat sebenarnya ada di
+    config agent (agent serve dilarang memakai tool interaktif / effect
+    "ask" — lihat opencode-core/), bukan di sini.
     """
     session_id = body.session_id or await _create_session(
         SessionIn(agent=body.agent, model=body.model)
@@ -224,8 +238,15 @@ async def chat_stream(body: ChatIn):
         model_id: str | None = None
         usage = None
         timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
+        started = time.monotonic()
         try:
             async with httpx.AsyncClient(base_url=BASE_URL, auth=AUTH, timeout=timeout) as client:
+                async def abort_best_effort():
+                    try:
+                        await client.post(f"/api/session/{session_id}/abort", json={})
+                    except Exception:
+                        pass
+
                 async with client.stream("GET", "/api/event") as resp:
                     if resp.status_code >= 400:
                         yield _sse({"error": f"opencode serve menjawab {resp.status_code} untuk /api/event"})
@@ -236,36 +257,71 @@ async def chat_stream(body: ChatIn):
                     if pr.status_code >= 400:
                         yield _sse({"error": f"prompt ditolak serve: {pr.status_code}"})
                         return
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
+
+                    queue: asyncio.Queue = asyncio.Queue()
+
+                    async def producer():
                         try:
-                            ev = json.loads(line[5:].strip())
-                        except ValueError:
-                            continue
-                        data = ev.get("data") or {}
-                        if data.get("sessionID") != session_id:
-                            continue
-                        etype = ev.get("type")
-                        if etype == "session.text.delta":
-                            delta = data.get("delta") or ""
-                            if delta:
-                                yield _sse({"text": delta})
-                        elif etype == "session.tool.input.started":
-                            name = data.get("name")
-                            if name:
-                                tools_used.append(name)
-                                yield _sse({"meta": {"tool": name}})
-                        elif etype == "session.step.started":
-                            model_id = (data.get("model") or {}).get("id") or model_id
-                        elif etype == "session.usage.updated":
-                            usage = {"cost": data.get("cost"), "tokens": data.get("tokens")}
-                        elif etype == "session.execution.succeeded":
-                            break
-                        elif etype == "session.execution.failed":
-                            err = (data.get("error") or {}).get("message") or "agent gagal"
-                            yield _sse({"error": err})
-                            return
+                            async for line in resp.aiter_lines():
+                                await queue.put(line)
+                        except Exception as exc:  # diteruskan ke konsumen
+                            await queue.put(exc)
+                        finally:
+                            await queue.put(None)
+
+                    task = asyncio.create_task(producer())
+                    try:
+                        while True:
+                            try:
+                                item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                            except asyncio.TimeoutError:
+                                if time.monotonic() - started > TIMEOUT_S:
+                                    await abort_best_effort()
+                                    yield _sse({"error": f"agent tidak selesai dalam {int(TIMEOUT_S)} detik — giliran dihentikan"})
+                                    return
+                                yield ": hb\n\n"  # heartbeat: jaga aliran dari timeout proxy
+                                continue
+                            if item is None:
+                                break  # aliran event serve berakhir
+                            if isinstance(item, Exception):
+                                raise item
+                            line = item
+                            if not line.startswith("data:"):
+                                continue
+                            try:
+                                ev = json.loads(line[5:].strip())
+                            except ValueError:
+                                continue
+                            data = ev.get("data") or {}
+                            if data.get("sessionID") != session_id:
+                                continue
+                            etype = ev.get("type")
+                            if etype == "session.text.delta":
+                                delta = data.get("delta") or ""
+                                if delta:
+                                    yield _sse({"text": delta})
+                            elif etype == "session.tool.input.started":
+                                name = data.get("name")
+                                if name:
+                                    tools_used.append(name)
+                                    yield _sse({"meta": {"tool": name}})
+                                    if name == "question":
+                                        await abort_best_effort()
+                                        yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/)"})
+                                        return
+                            elif etype == "session.step.started":
+                                model_id = (data.get("model") or {}).get("id") or model_id
+                            elif etype == "session.usage.updated":
+                                usage = {"cost": data.get("cost"), "tokens": data.get("tokens")}
+                            elif etype == "session.execution.succeeded":
+                                break
+                            elif etype == "session.execution.failed":
+                                raw = data.get("error")
+                                err = raw.get("message") if isinstance(raw, dict) else (raw or "agent gagal")
+                                yield _sse({"error": str(err)})
+                                return
+                    finally:
+                        task.cancel()
         except httpx.HTTPError as exc:
             yield _sse({"error": f"aliran event opencode terputus: {exc}"})
             return
