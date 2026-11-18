@@ -15,45 +15,67 @@
   "default_agent": "admin",
 
   "providers": {
-    "lyber": {
-      "name": "Lyber",
-      "env": ["LYBER_API_KEY"],
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "https://api.lyber.ai/v1" },
+    "agentrouter": {
+      "name": "AgentRouter",
+      "env": [
+        "AGENTROUTER_API_KEY"
+      ],
+      "package": "@opencode/ai/providers/openai",
+      "settings": {
+        "baseURL": "https://agentrouter.org/v1"
+      },
       "models": {
-        "kimi-k31-pro-abliterated": {
-          "name": "Kimi K3.1 Pro Abliterated (Lyber)",
-          // PLACEHOLDER context — verifikasi sebelum live (lihat publik).
-          "limit": { "context": 128000, "output": 8192 }
+        "gpt-6.1-sol": {
+          "name": "GPT 6.1 Sol",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     },
     "inception": {
       "name": "Inception Labs (Mercury)",
-      "env": ["MERCURY_API_KEY", "INCEPTION_API_KEY"],
+      "env": [
+        "INCEPTION_API_KEY"
+      ],
       "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "https://api.inceptionlabs.ai/v1" },
+      "settings": {
+        "baseURL": "https://api.inceptionlabs.ai/v1"
+      },
       "models": {
         "mercury-3": {
           "name": "Mercury 3",
-          "limit": { "context": 128000, "output": 8192 }
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     },
-    "agentrouter": {
-      "name": "AgentRouter",
-      "env": ["AGENTROUTER_API_KEY"],
-      // BUKAN openai-compatible: model GPT di AgentRouter hanya bicara
-      // Responses API, dan layanannya hanya menerima klien agent coding
-      // (opencode LOLOS - terbukti chat live 18 Nov 2026, 5,8 dtk).
-      // Backend FastAPI TIDAK bisa memakai key ini (client gating +
-      // protokol beda); jalur resminya memang lewat opencode.
-      "package": "@opencode/ai/providers/openai",
-      "settings": { "baseURL": "https://agentrouter.org/v1" },
+    "lyber": {
+      "name": "Lyber",
+      "env": [
+        "LYBER_API_KEY"
+      ],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://api.lyber.ai/v1"
+      },
       "models": {
-        "gpt-6.1-sol": {
-          "name": "GPT 6.1 Sol (AgentRouter)",
-          "limit": { "context": 128000, "output": 8192 }
+        "kimi-k31-pro-abliterated": {
+          "name": "Kimi K3.1 Pro Abliterated",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     }

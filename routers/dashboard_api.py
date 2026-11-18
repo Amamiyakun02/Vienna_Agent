@@ -1165,3 +1165,175 @@ async def test_ai_provider(
             "latency_ms": _latency(),
             "error": _mask_secrets(str(e))[:200] or "Koneksi gagal.",
         }
+
+
+# ── Publish: database -> config opencode ──
+# Admin memilih provider default + modelnya lewat CRUD di atas; publish
+# menerbitkan SEMUA provider aktif ke blok "providers" kedua config
+# opencode-core dan memasang model pilihan itu ke agent publik. DB =
+# sumber kebenaran, file config = artefak (komentar di dalam blok
+# providers akan tergantikan hasil generate; catatan pindah ke kolom
+# notes di DB). Instance serve harus direstart sesudah publish.
+
+import json as _json
+from pathlib import Path as _Path
+
+_PROJECT_ROOT = _Path(__file__).resolve().parents[1]
+_CONFIG_FILES = {
+    "public": _PROJECT_ROOT / "opencode-core" / "public" / "opencode.jsonc",
+    "admin": _PROJECT_ROOT / "opencode-core" / "admin" / "opencode.jsonc",
+}
+
+
+def _jsonc_block_span(text: str, key: str, start: int = 0) -> tuple[int, int]:
+    """(indeks '{', indeks '}') dari blok objek untuk "key": { ... }.
+
+    Scanner sadar string & komentar // — URL dan teks bebas tidak
+    mengacaukan hitungan kurung. ValueError bila tidak ketemu.
+    """
+    idx = text.index(f'"{key}"', start)
+    brace = text.index("{", idx)
+    depth = 0
+    i = brace
+    in_str = False
+    in_comment = False
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_comment:
+            if ch == "\n":
+                in_comment = False
+        elif in_str:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "/" and nxt == "/":
+            in_comment = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return brace, i
+        i += 1
+    raise ValueError(f"blok '{key}' tidak tertutup")
+
+
+def _providers_from_db(rows) -> dict:
+    providers: dict = {}
+    for p in rows:
+        if p.adapter != "openai-compatible" or p.status != "active":
+            continue
+        entry: dict = {"name": p.name}
+        if p.auth_env_var:
+            entry["env"] = [p.auth_env_var]
+        if p.package:
+            entry["package"] = p.package
+        if p.base_url:
+            entry["settings"] = {"baseURL": p.base_url}
+        entry["models"] = {
+            m["id"]: {
+                "name": m.get("name") or m["id"],
+                "limit": {"context": 128000, "output": 8192},
+            }
+            for m in (p.models or [])
+        }
+        providers[p.provider_key] = entry
+    # Urutan stabil menurut provider_key — hasil generate deterministik,
+    # diff config di git tetap bersih antar-publish.
+    return dict(sorted(providers.items()))
+
+
+def _render_providers_block(providers: dict) -> str:
+    body = _json.dumps(providers, indent=2, ensure_ascii=False)
+    lines = body.splitlines()
+    return "\n".join([lines[0]] + ["  " + line for line in lines[1:]])
+
+
+def _set_model_value(text: str, model_ref: str, agent: str | None) -> str:
+    """Ganti nilai "model" pertama: di level atas (agent=None) atau di
+    dalam blok agents.<agent>."""
+    if agent is None:
+        bound = text.index('"providers"')
+        head, tail = text[:bound], text[bound:]
+        head = _re.sub(r'"model"\s*:\s*"[^"]*"', f'"model": "{model_ref}"', head, count=1)
+        return head + tail
+    a0, a1 = _jsonc_block_span(text, "agents")
+    g0, g1 = _jsonc_block_span(text, agent, a0)
+    block = _re.sub(
+        r'"model"\s*:\s*"[^"]*"', f'"model": "{model_ref}"', text[g0 : g1 + 1], count=1
+    )
+    return text[:g0] + block + text[g1 + 1 :]
+
+
+@router.post("/ai-providers/publish")
+async def publish_ai_providers(
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    """Terbitkan registry DB ke config opencode-core + salinan live.
+
+    Blok providers kedua config ditulis ulang dari DB; model agent
+    publik (dan model level-atas config publik) dipasang ke
+    provider/model default pilihan admin. Config admin hanya menerima
+    blok providers — model agent admin tetap pilihannya sendiri.
+    """
+    rows = store.list_ai_providers(db)
+    default = next((p for p in rows if p.is_default and p.status == "active"), None)
+    if default is None or not default.default_model:
+        raise HTTPException(
+            status_code=422,
+            detail="Belum ada provider default aktif dengan default_model — pilih dulu lewat CRUD.",
+        )
+    model_ref = f"{default.provider_key}/{default.default_model}"
+    providers = _providers_from_db(rows)
+    block = _render_providers_block(providers)
+
+    targets: list[tuple[str, _Path]] = [
+        ("public", _CONFIG_FILES["public"]),
+        ("admin", _CONFIG_FILES["admin"]),
+    ]
+    live_dir = os.getenv("OPENCODE_PUBLIC_DIR", "").strip()
+    if live_dir:
+        targets.append(("public-live", _Path(live_dir).expanduser() / "opencode.jsonc"))
+
+    written: list[str] = []
+    skipped: list[str] = []
+    for label, path in targets:
+        if not path.exists():
+            skipped.append(f"{label}: {path} tidak ada")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            s, e = _jsonc_block_span(text, "providers")
+            text = text[:s] + block + text[e + 1 :]
+            if label != "admin":
+                text = _set_model_value(text, model_ref, agent=None)
+                text = _set_model_value(text, model_ref, agent="public")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gagal memproses {path}: {_mask_secrets(str(exc))[:200]}",
+            )
+        if label == "public-live":
+            path.with_suffix(".jsonc.bak").write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        path.write_text(text, encoding="utf-8")
+        written.append(str(path))
+    return {
+        "ok": True,
+        "model": model_ref,
+        "provider_default": default.provider_key,
+        "providers_diterbitkan": sorted(providers),
+        "files": written,
+        "dilewati": skipped,
+        "catatan": (
+            "Instance opencode harus direstart agar config baru terbaca "
+            "(laptop: ~/start-opencode-public.sh; VPS: systemctl restart opencode-public). "
+            "Sesi publik yang sudah berjalan ikut pindah model pada pesan berikutnya lewat router."
+        ),
+    }

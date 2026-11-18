@@ -658,6 +658,35 @@ def record_ai_provider_test(db, p: AiProvider, ok: bool) -> None:
     db.commit()
 
 
+def default_ai_model_ref() -> str | None:
+    """'provider_key/default_model' dari provider is_default yang aktif.
+
+    Dipakai router opencode agar pilihan admin di dashboard langsung
+    menjadi model bawaan sesi baru. None bila DB belum diatur / tidak
+    ada default — pemanggil jatuh ke env.
+    """
+    if _get_engine() is None:
+        return None
+    db = _Session()
+    try:
+        p = (
+            db.query(AiProvider)
+            .filter(
+                AiProvider.is_default.is_(True),
+                AiProvider.status == "active",
+                AiProvider.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if p and p.default_model:
+            return f"{p.provider_key}/{p.default_model}"
+        return None
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
 # ── Modul 5: Users (spec §7; diskusi skema 8 Nov 2026) ──
 # Registry user per project (konsumen pertama: ViennaAssistantMobile).
 # Password SELALU bcrypt — plaintext tidak pernah disimpan, hash tidak

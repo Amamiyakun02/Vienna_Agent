@@ -69,6 +69,20 @@ TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
 
+def _db_model_default() -> str | None:
+    """Model bawaan pilihan admin di dashboard (tabel ai_providers).
+
+    Registry dashboard adalah sumber kebenaran pilihan model publik;
+    env DEFAULT_MODEL hanya cadangan bila DB belum diatur / kosong.
+    """
+    try:
+        from services import dashboard_store as _store
+
+        return _store.default_ai_model_ref()
+    except Exception:
+        return None
+
+
 def _target(role: str | None) -> tuple[str, str, str, str]:
     """(role, base_url, agent_default, model_default) untuk satu role.
 
@@ -77,7 +91,7 @@ def _target(role: str | None) -> tuple[str, str, str, str]:
     """
     if (role or "").strip().lower() == "admin":
         return "admin", ADMIN_BASE_URL, ADMIN_AGENT, ADMIN_MODEL
-    return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, DEFAULT_MODEL
+    return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, _db_model_default() or DEFAULT_MODEL
 
 
 async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, **kwargs):
