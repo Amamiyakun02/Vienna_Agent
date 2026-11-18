@@ -198,6 +198,7 @@ async def chat(body: ChatIn):
     )
     if body.session_id:
         await _sync_session_model(session_id, body.model)
+    _log_chat(body, session_id)
     await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt})
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
@@ -212,6 +213,7 @@ async def chat(body: ChatIn):
     idle = next((m for m in reversed(messages) if m.get("type") == "idle"), None)
     if idle and idle.get("outcome") == "failed":
         error = (idle.get("error") or {}).get("message", "agent gagal tanpa pesan error")
+        print(f"[OPENCODE] gagal session={session_id} error={str(error)[:160]}", flush=True)
         return {"status": "error", "session_id": session_id, "response": "", "error": error}
 
     # Satu giliran = banyak pesan assistant (satu per langkah agent);
@@ -225,6 +227,7 @@ async def chat(body: ChatIn):
     text = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
     tools = [p.get("name") for m in turn for p in (m.get("content") or []) if p.get("type") == "tool"]
     model = (assistant.get("model") or {}).get("id")
+    print(f"[OPENCODE] selesai session={session_id} model={model} tools={tools}", flush=True)
     return {
         "status": "success",
         "session_id": session_id,
@@ -237,6 +240,18 @@ async def chat(body: ChatIn):
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _log_chat(body: ChatIn, session_id: str) -> None:
+    """Satu baris log per permintaan chat — router ini memang sengaja
+    tidak mencatat apa pun sebelumnya, makanya request opencode tidak
+    terlihat di log backend (beda dengan process_chat yang print [PROMPT])."""
+    preview = " ".join(body.prompt.split())[:80]
+    print(
+        f"[OPENCODE] chat session={session_id} agent={body.agent or DEFAULT_AGENT} "
+        f"model={body.model or DEFAULT_MODEL} hitl={body.hitl} prompt={preview!r}",
+        flush=True,
+    )
 
 
 @router.post("/chat/stream")
@@ -264,6 +279,7 @@ async def chat_stream(body: ChatIn):
     )
     if body.session_id:
         await _sync_session_model(session_id, body.model)
+    _log_chat(body, session_id)
 
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
@@ -310,6 +326,7 @@ async def chat_stream(body: ChatIn):
                             except asyncio.TimeoutError:
                                 if time.monotonic() - started > TIMEOUT_S:
                                     await abort_best_effort()
+                                    print(f"[OPENCODE] timeout session={session_id} setelah {int(TIMEOUT_S)} dtk", flush=True)
                                     yield _sse({"error": f"agent tidak selesai dalam {int(TIMEOUT_S)} detik — giliran dihentikan"})
                                     return
                                 yield ": hb\n\n"  # heartbeat: jaga aliran dari timeout proxy
@@ -355,6 +372,7 @@ async def chat_stream(body: ChatIn):
                                     yield _sse({"meta": {"tool": name}})
                                     if name == "question" and not body.hitl:
                                         await abort_best_effort()
+                                        print(f"[OPENCODE] dihentikan session={session_id}: tool question tanpa hitl", flush=True)
                                         yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/) atau kirim hitl=true dan jawab form-nya"})
                                         return
                             elif etype == "session.step.started":
@@ -366,13 +384,20 @@ async def chat_stream(body: ChatIn):
                             elif etype == "session.execution.failed":
                                 raw = data.get("error")
                                 err = raw.get("message") if isinstance(raw, dict) else (raw or "agent gagal")
+                                print(f"[OPENCODE] gagal session={session_id} error={str(err)[:160]}", flush=True)
                                 yield _sse({"error": str(err)})
                                 return
                     finally:
                         task.cancel()
         except httpx.HTTPError as exc:
+            print(f"[OPENCODE] aliran terputus session={session_id}: {exc}", flush=True)
             yield _sse({"error": f"aliran event opencode terputus: {exc}"})
             return
+        print(
+            f"[OPENCODE] selesai session={session_id} model={model_id} "
+            f"tools={tools_used} durasi={time.monotonic() - started:.1f}dtk",
+            flush=True,
+        )
         yield _sse({
             "done": True,
             "session_id": session_id,
@@ -407,6 +432,7 @@ async def reply_form(session_id: str, form_id: str, body: FormReplyIn):
         "POST", f"/api/session/{session_id}/form/{form_id}/reply",
         json={"answer": body.answer},
     )
+    print(f"[OPENCODE] HITL form dijawab session={session_id} form={form_id}", flush=True)
     return {"status": "success", "data": (data or {}).get("data")}
 
 
@@ -436,4 +462,5 @@ async def reply_permission(session_id: str, request_id: str, body: PermissionRep
         "POST", f"/api/session/{session_id}/permission/{request_id}/reply",
         json=payload,
     )
+    print(f"[OPENCODE] HITL permission session={session_id} request={request_id} decision={body.decision}", flush=True)
     return {"status": "success", "data": (data or {}).get("data")}
