@@ -83,6 +83,16 @@ class ChatIn(BaseModel):
     session_id: str | None = None
     agent: str | None = None
     model: str | None = None  # format "providerID/modelID"; hanya dipakai saat sesi baru dibuat
+    hitl: bool = False  # True = klien bisa menjawab form/permission agent (lihat /chat/stream)
+
+
+class FormReplyIn(BaseModel):
+    answer: dict  # peta key field -> nilai, sesuai definisi form dari event form.created
+
+
+class PermissionReplyIn(BaseModel):
+    decision: str  # "once" | "always" | "reject" (enum Permission.Reply di serve)
+    message: str | None = None
 
 
 async def _create_session(body: SessionIn) -> str:
@@ -293,10 +303,25 @@ async def chat_stream(body: ChatIn):
                             except ValueError:
                                 continue
                             data = ev.get("data") or {}
-                            if data.get("sessionID") != session_id:
+                            form = data.get("form") or {}
+                            ev_session = data.get("sessionID") or form.get("sessionID")
+                            if ev_session != session_id:
                                 continue
                             etype = ev.get("type")
-                            if etype == "session.text.delta":
+                            if etype == "form.created" and body.hitl:
+                                # Agent bertanya (tool question = form serve).
+                                # Teruskan definisinya; klien menjawab lewat
+                                # POST /sessions/{id}/forms/{form_id}/reply dan
+                                # agent melanjutkan di aliran yang sama.
+                                yield _sse({"meta": {"hitl_form": form}})
+                            elif etype == "form.cancelled" and body.hitl:
+                                yield _sse({"meta": {"hitl_form_cancelled": data.get("id")}})
+                            elif etype == "permission.asked" and body.hitl:
+                                # Agent meminta persetujuan aksi (effect "ask").
+                                # Klien menjawab lewat POST
+                                # /sessions/{id}/permissions/{request_id}/reply.
+                                yield _sse({"meta": {"hitl_permission": data}})
+                            elif etype == "session.text.delta":
                                 delta = data.get("delta") or ""
                                 if delta:
                                     yield _sse({"text": delta})
@@ -305,9 +330,9 @@ async def chat_stream(body: ChatIn):
                                 if name:
                                     tools_used.append(name)
                                     yield _sse({"meta": {"tool": name}})
-                                    if name == "question":
+                                    if name == "question" and not body.hitl:
                                         await abort_best_effort()
-                                        yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/)"})
+                                        yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/) atau kirim hitl=true dan jawab form-nya"})
                                         return
                             elif etype == "session.step.started":
                                 model_id = (data.get("model") or {}).get("id") or model_id
@@ -338,3 +363,54 @@ async def chat_stream(body: ChatIn):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- HITL: form (pertanyaan agent) & permission (persetujuan aksi) ---
+# Pasangan event "form.created"/"permission.asked" yang diteruskan
+# /chat/stream saat body hitl=true. Semua tipis di depan serve; auth
+# serve tetap di backend, browser tidak pernah menyentuh password serve.
+
+@router.get("/sessions/{session_id}/forms")
+async def list_forms(session_id: str):
+    """Form pertanyaan agent yang masih tertunda di sesi ini."""
+    data = await _oc("GET", f"/api/session/{session_id}/form")
+    return {"status": "success", "forms": (data or {}).get("data", [])}
+
+
+@router.post("/sessions/{session_id}/forms/{form_id}/reply")
+async def reply_form(session_id: str, form_id: str, body: FormReplyIn):
+    """Jawab form agent; agent melanjutkan gilirannya sesudah ini."""
+    data = await _oc(
+        "POST", f"/api/session/{session_id}/form/{form_id}/reply",
+        json={"answer": body.answer},
+    )
+    return {"status": "success", "data": (data or {}).get("data")}
+
+
+@router.delete("/sessions/{session_id}/forms/{form_id}")
+async def cancel_form(session_id: str, form_id: str):
+    """Batalkan form yang tertunda (agent menerima pembatalan)."""
+    await _oc("DELETE", f"/api/session/{session_id}/form/{form_id}")
+    return {"status": "success"}
+
+
+@router.get("/sessions/{session_id}/permissions")
+async def list_permissions(session_id: str):
+    """Permintaan persetujuan aksi yang masih tertunda di sesi ini."""
+    data = await _oc("GET", f"/api/session/{session_id}/permission")
+    return {"status": "success", "permissions": (data or {}).get("data", [])}
+
+
+@router.post("/sessions/{session_id}/permissions/{request_id}/reply")
+async def reply_permission(session_id: str, request_id: str, body: PermissionReplyIn):
+    """Jawab permintaan persetujuan: once (sekali), always (selalu), reject (tolak)."""
+    if body.decision not in ("once", "always", "reject"):
+        raise HTTPException(status_code=422, detail="decision harus 'once', 'always', atau 'reject'")
+    payload: dict = {"decision": body.decision}
+    if body.message:
+        payload["message"] = body.message
+    data = await _oc(
+        "POST", f"/api/session/{session_id}/permission/{request_id}/reply",
+        json=payload,
+    )
+    return {"status": "success", "data": (data or {}).get("data")}
