@@ -1412,3 +1412,161 @@ async def delete_ai_session(
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan.")
     store.soft_delete_ai_session(db, s)
     return {"ok": True, "deleted_id": row_id}
+
+
+# ── Overview: agregat siap tampil untuk tab Overview ──
+# Kontrak: catatan vault "Dashboard Overview - Kebutuhan Data Backend"
+# §3.1. Total sepanjang masa (requests/tokens/cost) bersumber dari
+# ai_sessions (kumulatif, memuat riwayat sebelum fitur ini ada);
+# rincian per jenis token, angka harian, kegagalan, dan latensi
+# bersumber dari ai_turns (per giliran, hanya sejak ai_turns dipasang).
+# Pengelompokan hari memakai Asia/Jakarta (WIB), bukan UTC.
+
+from collections import Counter as _Counter
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_WIB = _ZoneInfo("Asia/Jakarta")
+
+
+def _wib_date(dt) -> str | None:
+    """Tanggal WIB (YYYY-MM-DD) dari timestamp DB (UTC, tz-aware)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_timezone.utc)
+    return dt.astimezone(_WIB).date().isoformat()
+
+
+async def _probe_overview_instance(base: str) -> dict:
+    """Status + model default (ref penuh provider/model) satu instance
+    opencode-core — versi ringkas logika /v1/opencode/status."""
+    from routers import opencode_api as _oc_api
+
+    try:
+        async with _httpx.AsyncClient(base_url=base, auth=_oc_api.AUTH, timeout=5.0) as client:
+            resp = await client.get("/api/model/default")
+        if resp.status_code >= 400:
+            return {"status": "error", "default_model": None}
+        data = (resp.json() or {}).get("data") or {}
+        mid, pid = data.get("id"), data.get("providerID")
+        ref = f"{pid}/{mid}" if pid and mid else mid
+        return {"status": "ok", "default_model": ref}
+    except Exception:
+        return {"status": "unreachable", "default_model": None}
+
+
+@router.get("/overview")
+async def overview(
+    admin: str = Depends(require_admin),
+    db: Session = Depends(store.dashboard_session),
+):
+    from routers import opencode_api as _oc_api
+
+    sessions = db.query(store.AiSession).filter(store.AiSession.deleted_at.is_(None)).all()
+    turns = db.query(store.AiTurn).all()
+
+    today_wib = _datetime.now(_WIB).date()
+    days = [(today_wib - _timedelta(days=i)).isoformat() for i in range(13, -1, -1)]
+
+    # — Harian: request/token/biaya dari ai_turns; sesi aktif dari
+    #    updated_at ai_sessions (definisi widget yang sudah berjalan).
+    daily_map = {d: {"date": d, "requests": 0, "tokens": 0, "cost_usd": 0.0, "sessions_active": 0} for d in days}
+    for t in turns:
+        d = _wib_date(t.created_at)
+        if d in daily_map:
+            daily_map[d]["requests"] += 1
+            daily_map[d]["tokens"] += t.total_tokens or 0
+            daily_map[d]["cost_usd"] += t.total_cost or 0.0
+    active_by_day: dict[str, int] = {}
+    for s in sessions:
+        d = _wib_date(s.updated_at)
+        if d:
+            active_by_day[d] = active_by_day.get(d, 0) + 1
+    for d in days:
+        daily_map[d]["sessions_active"] = active_by_day.get(d, 0)
+        daily_map[d]["cost_usd"] = round(daily_map[d]["cost_usd"], 6)
+
+    today_str = today_wib.isoformat()
+    turns_today = [t for t in turns if _wib_date(t.created_at) == today_str]
+
+    by_model_map: dict[str, dict] = {}
+    for s in sessions:
+        key = s.model or "unknown"
+        row = by_model_map.setdefault(
+            key, {"model": key, "sessions": 0, "requests": 0, "tokens": 0, "cost_usd": 0.0}
+        )
+        row["sessions"] += 1
+        row["requests"] += s.prompt_count or 0
+        row["tokens"] += s.total_tokens or 0
+        row["cost_usd"] += s.total_cost or 0.0
+    by_model = sorted(by_model_map.values(), key=lambda r: r["tokens"], reverse=True)
+    for r in by_model:
+        r["cost_usd"] = round(r["cost_usd"], 6)
+
+    # Tool tersering: hitungan per giliran dari ai_turns; selama tabel
+    # itu masih kosong (masa transisi) jatuh ke gabungan per sesi.
+    tool_counter: _Counter = _Counter()
+    if turns:
+        for t in turns:
+            tool_counter.update(t.tools_used or [])
+    else:
+        for s in sessions:
+            tool_counter.update(s.tools_used or [])
+    by_tool = [{"tool": name, "count": n} for name, n in tool_counter.most_common(15)]
+
+    durations = [t.duration_ms for t in turns if t.duration_ms is not None]
+    recent = sorted(sessions, key=lambda s: s.updated_at or s.created_at, reverse=True)[:10]
+
+    def _count(model, extra=None):
+        q = db.query(model).filter(model.deleted_at.is_(None))
+        if extra is not None:
+            q = q.filter(extra)
+        return q.count()
+
+    return {
+        "generated_at": _datetime.now(_WIB).isoformat(),
+        "ai": {
+            "sessions_total": len(sessions),
+            "sessions_public": sum(1 for s in sessions if s.role == "public"),
+            "sessions_admin": sum(1 for s in sessions if s.role == "admin"),
+            "requests_total": sum(s.prompt_count or 0 for s in sessions),
+            "tokens_total": sum(s.total_tokens or 0 for s in sessions),
+            "tokens_input": sum(t.tokens_input or 0 for t in turns),
+            "tokens_output": sum(t.tokens_output or 0 for t in turns),
+            "tokens_cache_read": sum(t.tokens_cache_read or 0 for t in turns),
+            "cost_total_usd": round(sum(s.total_cost or 0.0 for s in sessions), 6),
+            "requests_today": len(turns_today),
+            "tokens_today": sum(t.total_tokens or 0 for t in turns_today),
+            "sessions_active_today": active_by_day.get(today_str, 0),
+            "turns_failed_total": sum(1 for t in turns if t.status == "error"),
+            "avg_turn_duration_ms": int(sum(durations) / len(durations)) if durations else 0,
+            "by_model": by_model,
+            "by_tool": by_tool,
+            "daily": [daily_map[d] for d in days],
+            "recent_sessions": [store.ai_session_to_dict(s) for s in recent],
+        },
+        "instances": {
+            "public": await _probe_overview_instance(_oc_api.PUBLIC_BASE_URL),
+            "admin": await _probe_overview_instance(_oc_api.ADMIN_BASE_URL),
+        },
+        "modules": {
+            "projects": {
+                "total": _count(store.Project),
+                "featured": _count(store.Project, store.Project.is_featured.is_(True)),
+            },
+            "integrations": {
+                "total": _count(store.Integration),
+                "active": _count(store.Integration, store.Integration.status == "active"),
+            },
+            "users": {
+                "total": _count(store.AppUser),
+                "active": _count(store.AppUser, store.AppUser.status == "active"),
+            },
+            "contents": {
+                "total": _count(store.Content),
+                "published": _count(store.Content, store.Content.status == "published"),
+            },
+            "providers": {"total": _count(store.AiProvider)},
+        },
+    }

@@ -879,6 +879,81 @@ def record_ai_session_turn(
         db.close()
 
 
+class AiTurn(Base):
+    """Satu baris per GILIRAN chat opencode (fondasi agregat harian
+    Overview — spec "Dashboard Overview - Kebutuhan Data Backend" §3.2).
+
+    Berbeda dari ai_sessions (kumulatif per sesi): nilai token/biaya di
+    sini adalah nilai giliran itu sendiri (selisih kumulatif serve),
+    dan giliran yang berakhir error pun dicatat (status="error").
+    Append-only: tidak ada soft delete.
+    """
+
+    __tablename__ = "ai_turns"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(20), nullable=False, default="public")
+    agent = Column(String(100), nullable=True)
+    model = Column(String(300), nullable=True)
+    admin_user = Column(String(100), nullable=True)
+    tokens_input = Column(Integer, nullable=False, default=0)
+    tokens_output = Column(Integer, nullable=False, default=0)
+    tokens_cache_read = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    total_cost = Column(Float, nullable=False, default=0.0)
+    tools_used = Column(JSON, nullable=False, default=list)
+    status = Column(String(20), nullable=False, default="ok")
+    duration_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+
+
+def record_ai_turn(
+    session_id: str,
+    role: str,
+    agent: str | None,
+    model: str | None,
+    admin_user: str | None,
+    tokens_input: int,
+    tokens_output: int,
+    tokens_cache_read: int,
+    total_tokens: int,
+    total_cost: float,
+    tools_used: list[str],
+    status: str,
+    duration_ms: int | None,
+) -> None:
+    """Tulis satu baris ai_turns. Membuka sesinya sendiri dan TIDAK
+    PERNAH melempar — sama seperti record_ai_session_turn, pencatatan
+    tidak boleh mengganggu percakapan."""
+    if not session_id or _get_engine() is None:
+        return
+    db = _Session()
+    try:
+        db.add(
+            AiTurn(
+                session_id=session_id,
+                role=role or "public",
+                agent=agent,
+                model=model,
+                admin_user=admin_user,
+                tokens_input=int(tokens_input or 0),
+                tokens_output=int(tokens_output or 0),
+                tokens_cache_read=int(tokens_cache_read or 0),
+                total_tokens=int(total_tokens or 0),
+                total_cost=float(total_cost or 0.0),
+                tools_used=list(tools_used or []),
+                status=status or "ok",
+                duration_ms=duration_ms,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def list_ai_sessions(db, role: str | None = None, q: str | None = None):
     query = db.query(AiSession).filter(AiSession.deleted_at.is_(None))
     if role:

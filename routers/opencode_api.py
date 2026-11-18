@@ -163,6 +163,74 @@ def _record_turn(
         pass
 
 
+def _split_tokens(tokens: dict | None) -> tuple[int, int, int, int]:
+    """(input, output+reasoning, cache_read, total) dari objek tokens serve."""
+    t = tokens or {}
+    cache = t.get("cache") or {}
+    return (
+        int(t.get("input") or 0),
+        int(t.get("output") or 0) + int(t.get("reasoning") or 0),
+        int(cache.get("read") or 0),
+        _tokens_total(t),
+    )
+
+
+def _usage_delta(start_usage: dict | None, end_usage: dict | None) -> dict:
+    """Nilai SATU giliran = selisih usage KUMULATIF serve (akhir - awal).
+
+    Serve hanya melaporkan kumulatif per sesi, jadi nilai giliran
+    diturunkan sebagai selisih dari potret awal giliran. Semua komponen
+    dijepit >= 0; potret akhir yang hilang berarti giliran dicatat 0.
+    """
+    s_in, s_out, s_cache, s_total = _split_tokens((start_usage or {}).get("tokens"))
+    e_in, e_out, e_cache, e_total = _split_tokens((end_usage or {}).get("tokens"))
+    s_cost = float((start_usage or {}).get("cost") or 0.0)
+    e_cost = float((end_usage or {}).get("cost") or 0.0)
+    return {
+        "tokens_input": max(0, e_in - s_in),
+        "tokens_output": max(0, e_out - s_out),
+        "tokens_cache_read": max(0, e_cache - s_cache),
+        "total_tokens": max(0, e_total - s_total),
+        "total_cost": max(0.0, e_cost - s_cost),
+    }
+
+
+def _record_ai_turn_only(
+    session_id: str,
+    role: str,
+    agent: str | None,
+    model: str | None,
+    admin_user: str | None,
+    start_usage: dict | None,
+    end_usage: dict | None,
+    tools: list[str],
+    status: str,
+    duration_ms: int | None,
+) -> None:
+    """Catat SATU giliran ke tabel ai_turns (termasuk giliran error).
+
+    Pasangan _record_turn (yang mengurus ai_sessions kumulatif dan
+    hanya berjalan untuk giliran sukses — perilakunya tidak diubah).
+    Sama-sama best-effort: tidak pernah melempar.
+    """
+    try:
+        from services import dashboard_store as _store
+
+        _store.record_ai_turn(
+            session_id=session_id,
+            role=role,
+            agent=agent,
+            model=model,
+            admin_user=admin_user,
+            tools_used=tools,
+            status=status,
+            duration_ms=duration_ms,
+            **_usage_delta(start_usage, end_usage),
+        )
+    except Exception:
+        pass
+
+
 async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, **kwargs):
     """Satu pintu ke opencode serve; error diterjemahkan ke HTTP backend."""
     base_url = base or ADMIN_BASE_URL
@@ -390,6 +458,11 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         if limit_error:
             print(f"[OPENCODE] limit publik session={session_id}: {limit_error}", flush=True)
             return {"status": "error", "session_id": session_id, "response": "", "error": limit_error}
+    started = time.monotonic()
+    start_usage = {
+        "cost": (session_data or {}).get("cost"),
+        "tokens": (session_data or {}).get("tokens"),
+    }
     await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt}, base=base)
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
@@ -401,22 +474,33 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         key=lambda m: (m.get("time") or {}).get("created", 0),
     )
 
-    idle = next((m for m in reversed(messages) if m.get("type") == "idle"), None)
-    if idle and idle.get("outcome") == "failed":
-        error = (idle.get("error") or {}).get("message", "agent gagal tanpa pesan error")
-        print(f"[OPENCODE] gagal session={session_id} error={str(error)[:160]}", flush=True)
-        return {"status": "error", "session_id": session_id, "response": "", "error": error}
-
     # Satu giliran = banyak pesan assistant (satu per langkah agent);
     # yang relevan hanya yang sesudah pesan user terakhir.
     last_user_idx = max((i for i, m in enumerate(messages) if m.get("type") == "user"), default=-1)
     turn = [m for m in messages[last_user_idx + 1:] if m.get("type") == "assistant"]
+    tools = [p.get("name") for m in turn for p in (m.get("content") or []) if p.get("type") == "tool"]
+
+    idle = next((m for m in reversed(messages) if m.get("type") == "idle"), None)
+    if idle and idle.get("outcome") == "failed":
+        error = (idle.get("error") or {}).get("message", "agent gagal tanpa pesan error")
+        print(f"[OPENCODE] gagal session={session_id} error={str(error)[:160]}", flush=True)
+        _record_ai_turn_only(
+            session_id, role, body.agent or agent_default, None, admin_user,
+            start_usage, None, tools, "error",
+            int((time.monotonic() - started) * 1000),
+        )
+        return {"status": "error", "session_id": session_id, "response": "", "error": error}
+
     if not turn:
+        _record_ai_turn_only(
+            session_id, role, body.agent or agent_default, None, admin_user,
+            start_usage, None, tools, "error",
+            int((time.monotonic() - started) * 1000),
+        )
         return {"status": "error", "session_id": session_id, "response": "", "error": "Tidak ada jawaban assistant."}
     assistant = turn[-1]
     parts = assistant.get("content") or []
     text = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
-    tools = [p.get("name") for m in turn for p in (m.get("content") or []) if p.get("type") == "tool"]
     model = (assistant.get("model") or {}).get("id")
     print(f"[OPENCODE] selesai session={session_id} model={model} tools={tools}", flush=True)
     usage = None
@@ -429,6 +513,11 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     _record_turn(
         session_id, role, assistant.get("agent") or (body.agent or agent_default),
         model, admin_user, body.prompt, usage, tools,
+    )
+    _record_ai_turn_only(
+        session_id, role, assistant.get("agent") or (body.agent or agent_default),
+        model, admin_user, start_usage, usage, tools, "ok",
+        int((time.monotonic() - started) * 1000),
     )
     return {
         "status": "success",
@@ -494,6 +583,10 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
     turn_start_tokens = _tokens_total((session_data or {}).get("tokens")) if session_data else 0
+    start_usage = {
+        "cost": (session_data or {}).get("cost"),
+        "tokens": (session_data or {}).get("tokens"),
+    }
 
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
@@ -502,6 +595,13 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
         usage = None
         timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
         started = time.monotonic()
+
+        def _rec_turn(status: str) -> None:
+            _record_ai_turn_only(
+                session_id, role, body.agent or agent_default, model_id,
+                admin_user, start_usage, usage, tools_used, status,
+                int((time.monotonic() - started) * 1000),
+            )
         try:
             async with httpx.AsyncClient(base_url=base, auth=AUTH, timeout=timeout) as client:
                 async def abort_best_effort():
@@ -512,12 +612,14 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
 
                 async with client.stream("GET", "/api/event") as resp:
                     if resp.status_code >= 400:
+                        _rec_turn("error")
                         yield _sse({"error": f"opencode serve menjawab {resp.status_code} untuk /api/event"})
                         return
                     pr = await client.post(
                         f"/api/session/{session_id}/prompt", json={"text": body.prompt}
                     )
                     if pr.status_code >= 400:
+                        _rec_turn("error")
                         yield _sse({"error": f"prompt ditolak serve: {pr.status_code}"})
                         return
 
@@ -541,6 +643,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                 if time.monotonic() - started > TIMEOUT_S:
                                     await abort_best_effort()
                                     print(f"[OPENCODE] timeout session={session_id} setelah {int(TIMEOUT_S)} dtk", flush=True)
+                                    _rec_turn("error")
                                     yield _sse({"error": f"agent tidak selesai dalam {int(TIMEOUT_S)} detik — giliran dihentikan"})
                                     return
                                 yield ": hb\n\n"  # heartbeat: jaga aliran dari timeout proxy
@@ -587,6 +690,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                     if name == "question" and not body.hitl:
                                         await abort_best_effort()
                                         print(f"[OPENCODE] dihentikan session={session_id}: tool question tanpa hitl", flush=True)
+                                        _rec_turn("error")
                                         yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/) atau kirim hitl=true dan jawab form-nya"})
                                         return
                             elif etype == "session.step.started":
@@ -600,6 +704,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                 ):
                                     await abort_best_effort()
                                     print(f"[OPENCODE] limit per giliran session={session_id}", flush=True)
+                                    _rec_turn("error")
                                     yield _sse({"error": "Giliran ini dihentikan: pemakaian token melebihi batas per giliran. Persingkat permintaanmu."})
                                     return
                             elif etype == "session.execution.succeeded":
@@ -608,12 +713,14 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                 raw = data.get("error")
                                 err = raw.get("message") if isinstance(raw, dict) else (raw or "agent gagal")
                                 print(f"[OPENCODE] gagal session={session_id} error={str(err)[:160]}", flush=True)
+                                _rec_turn("error")
                                 yield _sse({"error": str(err)})
                                 return
                     finally:
                         task.cancel()
         except httpx.HTTPError as exc:
             print(f"[OPENCODE] aliran terputus session={session_id}: {exc}", flush=True)
+            _rec_turn("error")
             yield _sse({"error": f"aliran event opencode terputus: {exc}"})
             return
         print(
@@ -625,6 +732,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
             session_id, role, body.agent or agent_default, model_id,
             admin_user, body.prompt, usage, tools_used,
         )
+        _rec_turn("ok")
         yield _sse({
             "done": True,
             "session_id": session_id,
