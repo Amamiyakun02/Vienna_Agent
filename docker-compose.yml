@@ -16,8 +16,15 @@
 # Jalankan:  docker compose up -d --build
 # Cek:       docker compose ps && curl http://127.0.0.1:8000/health
 #
-# opencode serve TIDAK di-container-kan di v1 ini: ia tetap jalan di
-# host VPS; backend menjangkaunya lewat host.docker.internal:4096.
+# opencode serve TIDAK di-container-kan: ia tetap jalan di host VPS
+# sebagai DUA instance systemd — admin :4096 dan publik :4097 (lihat
+# opencode-core/). Backend menjangkau keduanya lewat
+# host.docker.internal (env OPENCODE_ADMIN_BASE_URL /
+# OPENCODE_PUBLIC_BASE_URL di service backend). Sebaliknya, publish
+# dashboard menulis config opencode-core + salinan live agent publik
+# di HOST — karena itu dua folder itu di-bind-mount ke container
+# backend; tanpa mount, publish hanya menulis ke filesystem container
+# dan tidak pernah sampai ke serve.
 
 services:
   backend:
@@ -39,6 +46,18 @@ services:
       REDIS_PORT: "6379"
       MCP_URL: http://mcp:8001/mcp
       OPENCODE_BASE_URL: http://host.docker.internal:4096
+      # Dua instance opencode-core di host (isolasi per role). Tanpa
+      # override ini role publik jatuh ke 127.0.0.1:4097 DI DALAM
+      # container (= container itu sendiri) dan Assistant mati.
+      OPENCODE_ADMIN_BASE_URL: http://host.docker.internal:4096
+      OPENCODE_PUBLIC_BASE_URL: http://host.docker.internal:4097
+      # Salinan live config agent publik di host (lihat volumes).
+      OPENCODE_PUBLIC_DIR: /app/agent-public
+    volumes:
+      # Publish dashboard harus menulis ke file yang dibaca serve di
+      # host, bukan ke salinan di dalam image.
+      - ./opencode-core:/app/opencode-core
+      - ../agent-public:/app/agent-public
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -74,7 +93,12 @@ services:
       SSE_PORT: "8001"
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ""
-    # Tanpa ports: hanya backend yang memanggil http://mcp:8001/mcp
+    # Backend memanggil http://mcp:8001/mcp lewat jaringan internal.
+    # Port host HANYA localhost: instance opencode-core di host
+    # (config-nya menunjuk 127.0.0.1:8001/mcp) harus bisa menjangkau
+    # MCP ini juga — tanpa baris ini agent kehilangan tool MCP-nya.
+    ports:
+      - "127.0.0.1:8001:8001"
     expose:
       - "8001"
     depends_on:

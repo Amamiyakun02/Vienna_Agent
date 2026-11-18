@@ -4,13 +4,19 @@ Arsitektur produksi (keputusan 13–15 Nov 2026):
 
 - **Core AI agent = opencode serve di HOST VPS** (bukan container):
   dua instance systemd — **admin** port 4096 (agent `admin`, model Lyber
-  Kimi K3.1 Abliterated, folder kerja project ini) dan **publik** port
-  4097 (agent `public`, model Mercury, sandbox `~/apps/agent-public/`).
+  Kimi K3.1 Abliterated, folder kerja `admin-workspace/` di dalam
+  project ini) dan **publik** port 4097 (agent `public`, model Mercury,
+  sandbox `~/apps/agent-public/`).
   Config & unit-nya di folder `opencode-core/` (lihat README-nya).
 - **Backend + pendukung = Docker Compose** (`docker-compose.yml`):
   backend (hanya `127.0.0.1:8000`), mcp, postgres (DB dashboard),
   qdrant (vector DB), redis — selain backend semua jaringan internal.
-  Backend menjangkau opencode admin via `host.docker.internal:4096`.
+  Backend menjangkau opencode admin via `host.docker.internal:4096`
+  dan publik via `host.docker.internal:4097`. Folder `opencode-core/`
+  dan `../agent-public/` di-bind-mount ke container backend supaya
+  publish dashboard menulis file yang benar-benar dibaca serve di
+  host; service mcp menerbitkan `127.0.0.1:8001` (localhost saja)
+  supaya opencode di host bisa menjangkau tool MCP-nya.
 - **MongoDB tetap cloud (Atlas)** — bukan container.
 - Frontend di Vercel; akses publik ke backend nanti via reverse proxy
   ke `api.amamiya.web.id` (di luar dokumen ini).

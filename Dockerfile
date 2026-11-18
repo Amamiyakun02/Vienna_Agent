@@ -29,6 +29,10 @@ COPY services/ ./services/
 COPY models/ ./models/
 COPY utils/ ./utils/
 COPY rag/ ./rag/
+# Config opencode-core dibaca/ditulis fitur publish dashboard
+# (routers/dashboard_api.py memakai path <root>/opencode-core/...).
+# Di compose, folder ini di-bind-mount dari host menimpa salinan ini.
+COPY opencode-core/ ./opencode-core/
 
 # Cache downloader sifatnya ephemeral — siapkan dir kosongnya saja.
 RUN mkdir -p /app/data && chmod 777 /app/data
