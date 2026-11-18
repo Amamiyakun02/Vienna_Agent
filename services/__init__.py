@@ -14,6 +14,7 @@ from .agent_service import (
     MercuryAgentEngine,
     DeepSeekAgentEngine,
     LyberAgentEngine,
+    AgentRouterAgentEngine,
     is_portfolio_persona,
     PORTFOLIO_ASSISTANT_IDS,
 )
