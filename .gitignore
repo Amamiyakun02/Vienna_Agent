@@ -147,3 +147,7 @@ docker-compose.override.yml
 k8s/secrets/
 .nginx.conf
 DEPLOYMENT.md
+
+# Direktori kerja agent admin opencode (admin-workspace) — isi hasil
+# kerja agent + data sesinya, bukan kode project; jangan di-commit.
+/admin-workspace/

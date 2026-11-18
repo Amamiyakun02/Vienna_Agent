@@ -6,9 +6,8 @@ Wants=docker.service
 [Service]
 Type=simple
 User=amamiya
-WorkingDirectory=/home/amamiya/apps/Vienna_Agent
-EnvironmentFile=/home/amamiya/apps/Vienna_Agent/.env
-ExecStart=/home/amamiya/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
+Environment=BACKEND_DIR=/home/amamiya/apps/Vienna_Agent
+ExecStart=/home/amamiya/apps/Vienna_Agent/opencode-core/start-admin.sh
 Restart=on-failure
 RestartSec=5
 

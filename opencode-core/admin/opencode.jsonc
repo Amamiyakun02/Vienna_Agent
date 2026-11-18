@@ -2,11 +2,16 @@
   "$schema": "https://opencode.ai/config.json",
 
   // ============================================================
-  // INSTANCE ADMIN — lewat System Dashboard (sudah login)
-  // File ini yang nanti disalin ke AKAR project Vienna_Agent
-  // (~/apps/Vienna_Agent/opencode.jsonc di VPS), dan serve admin
-  // dijalankan dari folder project itu. Port 4096 = yang sudah
-  // dipakai routers/opencode_api.py sekarang (OPENCODE_BASE_URL).
+  // INSTANCE ADMIN — lewat System Dashboard (sudah login; router
+  // backend mewajibkan token dashboard untuk role ini). Serve
+  // dijalankan opencode-core/start-admin.sh dari direktori kerja
+  // KHUSUS <project>/admin-workspace dengan OPENCODE_CONFIG
+  // menunjuk file ini: agent berakses penuh DI DALAM direktori
+  // itu dan DITOLAK menyentuh sisa project (permission
+  // external_directory: deny di bawah). Port default 4096 (VPS);
+  // laptop 4098 lewat env OPENCODE_ADMIN_PORT (4096 ditempati
+  // serve pribadi). Publish dashboard menulis blok providers +
+  // model agent file ini — tidak ada salinan config kedua.
   // Approval & audit TIDAK di sini: itu gerbang dashboard/backend
   // SEBELUM prompt dikirim. Di serve headless jangan pakai "ask".
   // ============================================================
@@ -76,6 +81,13 @@
             "context": 128000,
             "output": 8192
           }
+        },
+        "deepseek-v4.1-flash-1017-abliterated": {
+          "name": "DeepSeek V4.1 Flash 1017",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     }
@@ -109,9 +121,10 @@
       "mode": "primary",
       "model": "lyber/kimi-k31-pro-abliterated",
       "steps": 30,
-      "system": "Kamu adalah agent administrator untuk Amamiya, dijalankan lewat System Dashboard yang sudah ter-login. Kamu boleh bekerja penuh di server ini. Wajib: jangan pernah membaca file .env atau menampilkan kredensial; untuk aksi destruktif (hapus data, deploy, restart service) sebutkan dulu di jawaban apa yang akan dilakukan dan tunggu perintah eksplisit di pesan berikutnya. Ikuti protokol memory di instruksi.",
+      "system": "Kamu adalah agent administrator untuk Amamiya, dijalankan lewat System Dashboard yang sudah ter-login. WILAYAH KERJAMU HANYA direktori kerja ini (admin-workspace di dalam project Vienna_Agent): di dalamnya kamu berakses penuh. Di luar direktori ini wilayah terlarang — jangan pernah membaca, mengubah, atau menghapus program lain di dalam project (backend, frontend, config) maupun file lain di mesin ini; tool file memang dikunci ke direktori ini. Wajib: jangan pernah membaca file .env atau menampilkan kredensial; untuk aksi destruktif (hapus data, deploy, restart service) sebutkan dulu di jawaban apa yang akan dilakukan dan tunggu perintah eksplisit di pesan berikutnya. Ikuti protokol memory di instruksi.",
       "permissions": [
         { "action": "*", "resource": "*", "effect": "allow" },
+        { "action": "external_directory", "resource": "*", "effect": "deny" },
         { "action": "read", "resource": "*.env", "effect": "deny" },
         { "action": "read", "resource": "*.env.*", "effect": "deny" },
         { "action": "shell", "resource": "sudo *", "effect": "deny" }
