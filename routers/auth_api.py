@@ -1,4 +1,5 @@
 import os
+import secrets
 import hashlib
 import base64
 import hmac
@@ -21,7 +22,7 @@ from services.mongo_service import users_col, get_user_by_email, migrate_anonymo
 
 router = APIRouter(prefix="/v1/auth", tags=["Authentication"])
 
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-jwt-key-aimer-future-2026-06-02")
+JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(32)
 JWT_ALGORITHM = "HS256"
 
 class GoogleLoginRequest(BaseModel):

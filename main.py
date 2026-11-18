@@ -1,4 +1,5 @@
 import os
+import secrets
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import re
 import jwt
@@ -28,8 +29,8 @@ from services.redis_service import redis_client
 
 from fastapi.staticfiles import StaticFiles
 load_dotenv()
-DEFAULT_JWT_SECRET = "super-secret-jwt-key-aimer-future-2026-06-02"
-JWT_SECRET = os.getenv("JWT_SECRET", DEFAULT_JWT_SECRET)
+JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(32)
+_JWT_FROM_ENV = bool(os.getenv("JWT_SECRET"))
 JWT_ALGORITHM = "HS256"
 
 _DEFAULT_CORS_ORIGINS = [
@@ -60,7 +61,7 @@ def _is_origin_allowed(origin: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if JWT_SECRET == DEFAULT_JWT_SECRET:
+    if not _JWT_FROM_ENV:
         print("[SECURITY WARNING] JWT_SECRET not set — using insecure default. Set JWT_SECRET in .env!")
     # Pre-fetch and cache MCP tools concurrently during server startup
     try:
