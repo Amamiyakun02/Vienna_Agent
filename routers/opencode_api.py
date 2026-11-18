@@ -83,14 +83,26 @@ def _db_model_default() -> str | None:
         return None
 
 
+def _db_admin_model_default() -> str | None:
+    """Model bawaan agent admin pilihan dashboard (is_default_admin)."""
+    try:
+        from services import dashboard_store as _store
+
+        return _store.default_admin_ai_model_ref()
+    except Exception:
+        return None
+
+
 def _target(role: str | None) -> tuple[str, str, str, str]:
     """(role, base_url, agent_default, model_default) untuk satu role.
 
     Default SELALU publik (hak paling kecil); admin hanya bila diminta
     persis "admin" — dan role admin digerbang _admin_gate di bawah.
+    Model bawaan kedua role dibaca dari registry dashboard lebih dulu
+    (pilihan admin), env hanya cadangan.
     """
     if (role or "").strip().lower() == "admin":
-        return "admin", ADMIN_BASE_URL, ADMIN_AGENT, ADMIN_MODEL
+        return "admin", ADMIN_BASE_URL, ADMIN_AGENT, _db_admin_model_default() or ADMIN_MODEL
     return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, _db_model_default() or DEFAULT_MODEL
 
 

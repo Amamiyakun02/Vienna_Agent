@@ -961,6 +961,7 @@ class AiProviderIn(BaseModel):
     models: list[AiModelIn] = []
     default_model: str | None = None
     is_default: bool = False
+    is_default_admin: bool = False
     status: Literal["active", "inactive"] = "active"
     notes: str | None = None
 
@@ -1269,25 +1270,44 @@ def _set_model_value(text: str, model_ref: str, agent: str | None) -> str:
     return text[:g0] + block + text[g1 + 1 :]
 
 
+class PublishIn(BaseModel):
+    role: str = "public"
+
+
 @router.post("/ai-providers/publish")
 async def publish_ai_providers(
+    payload: PublishIn | None = None,
     admin: str = Depends(require_admin),
     db: Session = Depends(store.dashboard_session),
 ):
-    """Terbitkan registry DB ke config opencode-core + salinan live.
+    """Terbitkan registry DB ke config opencode-core, per role.
 
-    Blok providers kedua config ditulis ulang dari DB; model agent
-    publik (dan model level-atas config publik) dipasang ke
-    provider/model default pilihan admin. Config admin hanya menerima
-    blok providers — model agent admin tetap pilihannya sendiri.
+    Blok providers kedua config selalu ditulis ulang dari DB. Model
+    yang dipasang tergantung role (body {"role": "public"|"admin"},
+    tanpa body = "public" demi kompatibilitas lama):
+    - public: model agent publik dari provider is_default, ditulis ke
+      config publik (+ salinan live OPENCODE_PUBLIC_DIR).
+    - admin: model agent admin dari provider is_default_admin,
+      ditulis ke config admin (instance serve membaca file repo ini
+      langsung lewat OPENCODE_CONFIG — tak ada salinan live kedua).
+    Dua flag default itu independen; satu provider boleh memegang
+    keduanya.
     """
+    role = (payload.role if payload else "public").strip().lower()
+    if role != "admin":
+        role = "public"
     rows = store.list_ai_providers(db)
-    default = next((p for p in rows if p.is_default and p.status == "active"), None)
-    if default is None or not default.default_model:
-        raise HTTPException(
-            status_code=422,
-            detail="Belum ada provider default aktif dengan default_model — pilih dulu lewat CRUD.",
+    if role == "admin":
+        default = next((p for p in rows if p.is_default_admin and p.status == "active"), None)
+        missing = (
+            "Belum ada provider default admin aktif dengan default_model "
+            "— tetapkan dulu lewat CRUD (flag 'default admin')."
         )
+    else:
+        default = next((p for p in rows if p.is_default and p.status == "active"), None)
+        missing = "Belum ada provider default aktif dengan default_model — pilih dulu lewat CRUD."
+    if default is None or not default.default_model:
+        raise HTTPException(status_code=422, detail=missing)
     model_ref = f"{default.provider_key}/{default.default_model}"
     providers = _providers_from_db(rows)
     block = _render_providers_block(providers)
@@ -1310,9 +1330,12 @@ async def publish_ai_providers(
             text = path.read_text(encoding="utf-8")
             s, e = _jsonc_block_span(text, "providers")
             text = text[:s] + block + text[e + 1 :]
-            if label != "admin":
+            if role == "public" and label in ("public", "public-live"):
                 text = _set_model_value(text, model_ref, agent=None)
                 text = _set_model_value(text, model_ref, agent="public")
+            elif role == "admin" and label == "admin":
+                text = _set_model_value(text, model_ref, agent=None)
+                text = _set_model_value(text, model_ref, agent="admin")
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
@@ -1324,18 +1347,27 @@ async def publish_ai_providers(
             )
         path.write_text(text, encoding="utf-8")
         written.append(str(path))
+    if role == "admin":
+        catatan = (
+            "Instance opencode ADMIN harus direstart agar config baru terbaca "
+            "(laptop: ~/start-opencode-admin.sh; VPS: systemctl restart opencode-admin). "
+            "Sesi admin yang sudah berjalan ikut pindah model pada pesan berikutnya lewat router."
+        )
+    else:
+        catatan = (
+            "Instance opencode harus direstart agar config baru terbaca "
+            "(laptop: ~/start-opencode-public.sh; VPS: systemctl restart opencode-public). "
+            "Sesi publik yang sudah berjalan ikut pindah model pada pesan berikutnya lewat router."
+        )
     return {
         "ok": True,
+        "role": role,
         "model": model_ref,
         "provider_default": default.provider_key,
         "providers_diterbitkan": sorted(providers),
         "files": written,
         "dilewati": skipped,
-        "catatan": (
-            "Instance opencode harus direstart agar config baru terbaca "
-            "(laptop: ~/start-opencode-public.sh; VPS: systemctl restart opencode-public). "
-            "Sesi publik yang sudah berjalan ikut pindah model pada pesan berikutnya lewat router."
-        ),
+        "catatan": catatan,
     }
 
 

@@ -283,6 +283,15 @@ def init_dashboard_db() -> bool:
             conn.execute(
                 text("ALTER TABLE projects ADD COLUMN featured_order INTEGER")
             )
+    prov_cols = {c["name"] for c in inspect(_engine).get_columns("ai_providers")}
+    if "is_default_admin" not in prov_cols:
+        with _engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE ai_providers ADD COLUMN is_default_admin "
+                    "BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
     db = _Session()
     try:
         if db.query(Project).count() == 0:
@@ -302,6 +311,30 @@ def init_dashboard_db() -> bool:
                 db.add(AiProvider(**row))
             db.commit()
             print(f"[DASHBOARD] Tabel ai_providers dibuat + seed {len(_AI_PROVIDER_SEED)} provider AI.")
+        # Default admin awal: lyber (model agent admin yang berjalan) —
+        # hanya bila belum ada satu pun provider ber-flag default admin,
+        # supaya pilihan admin sesudahnya tidak pernah ditimpa init.
+        if (
+            db.query(AiProvider)
+            .filter(
+                AiProvider.is_default_admin.is_(True),
+                AiProvider.deleted_at.is_(None),
+            )
+            .first()
+            is None
+        ):
+            lyber = (
+                db.query(AiProvider)
+                .filter(
+                    AiProvider.provider_key == "lyber",
+                    AiProvider.deleted_at.is_(None),
+                )
+                .first()
+            )
+            if lyber is not None:
+                lyber.is_default_admin = True
+                db.commit()
+                print("[DASHBOARD] Provider lyber ditetapkan sebagai default admin AI.")
     finally:
         db.close()
     return True
@@ -504,6 +537,7 @@ class AiProvider(Base):
     models = Column(JSON, nullable=False, default=list)
     default_model = Column(String(300), nullable=True)
     is_default = Column(Boolean, nullable=False, default=False)
+    is_default_admin = Column(Boolean, nullable=False, default=False)
     status = Column(String(20), nullable=False, default="active")
     notes = Column(Text, nullable=True)
     last_tested_at = Column(DateTime(timezone=True), nullable=True)
@@ -541,6 +575,7 @@ _AI_PROVIDER_SEED = [
         "models": [{"id": "kimi-k31-pro-abliterated", "name": "Kimi K3.1 Pro Abliterated"}],
         "default_model": "kimi-k31-pro-abliterated",
         "is_default": False,
+        "is_default_admin": True,
         "notes": "Model agent admin (dashboard). Harga resmi $4/$0,40/$15 per 1 jt token (input/cached/output).",
     },
     {
@@ -576,6 +611,7 @@ def ai_provider_to_dict(p: AiProvider) -> dict:
         "models": p.models or [],
         "default_model": p.default_model,
         "is_default": bool(p.is_default),
+        "is_default_admin": bool(p.is_default_admin),
         "status": p.status,
         "notes": p.notes,
         "last_tested_at": p.last_tested_at.isoformat() if p.last_tested_at else None,
@@ -626,12 +662,24 @@ def _clear_default_ai_provider(db, except_id: int | None = None) -> None:
         other.is_default = False
 
 
+def _clear_default_admin_ai_provider(db, except_id: int | None = None) -> None:
+    query = db.query(AiProvider).filter(
+        AiProvider.is_default_admin.is_(True), AiProvider.deleted_at.is_(None)
+    )
+    if except_id is not None:
+        query = query.filter(AiProvider.id != except_id)
+    for other in query.all():
+        other.is_default_admin = False
+
+
 def create_ai_provider(db, data: dict) -> AiProvider:
     p = AiProvider(**data)
     db.add(p)
     db.flush()
     if p.is_default:
         _clear_default_ai_provider(db, except_id=p.id)
+    if p.is_default_admin:
+        _clear_default_admin_ai_provider(db, except_id=p.id)
     db.commit()
     db.refresh(p)
     return p
@@ -642,6 +690,8 @@ def update_ai_provider(db, p: AiProvider, data: dict) -> AiProvider:
         setattr(p, key, value)
     if p.is_default:
         _clear_default_ai_provider(db, except_id=p.id)
+    if p.is_default_admin:
+        _clear_default_admin_ai_provider(db, except_id=p.id)
     db.commit()
     db.refresh(p)
     return p
@@ -650,6 +700,7 @@ def update_ai_provider(db, p: AiProvider, data: dict) -> AiProvider:
 def soft_delete_ai_provider(db, p: AiProvider) -> None:
     p.deleted_at = _now()
     p.is_default = False
+    p.is_default_admin = False
     db.commit()
 
 
@@ -674,6 +725,34 @@ def default_ai_model_ref() -> str | None:
             db.query(AiProvider)
             .filter(
                 AiProvider.is_default.is_(True),
+                AiProvider.status == "active",
+                AiProvider.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if p and p.default_model:
+            return f"{p.provider_key}/{p.default_model}"
+        return None
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def default_admin_ai_model_ref() -> str | None:
+    """'provider_key/default_model' dari provider is_default_admin aktif.
+
+    Pasangan default_ai_model_ref untuk role admin — router opencode
+    membacanya lebih dulu daripada env OPENCODE_ADMIN_MODEL.
+    """
+    if _get_engine() is None:
+        return None
+    db = _Session()
+    try:
+        p = (
+            db.query(AiProvider)
+            .filter(
+                AiProvider.is_default_admin.is_(True),
                 AiProvider.status == "active",
                 AiProvider.deleted_at.is_(None),
             )
