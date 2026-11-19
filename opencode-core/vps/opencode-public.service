@@ -9,7 +9,11 @@ User=amamiya
 WorkingDirectory=/home/amamiya/apps/agent-public
 EnvironmentFile=/home/amamiya/apps/Vienna_Agent/.env
 Environment=XDG_DATA_HOME=/home/amamiya/apps/agent-public/.data
-ExecStart=/home/amamiya/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4097
+# Backend di container menjangkau serve ini lewat gateway Docker
+# (host.docker.internal), bukan loopback — dengarkan semua
+# antarmuka. UFW VPS membatasi 4096/4097 hanya untuk subnet
+# Docker (172.16.0.0/12); port ini TIDAK dibuka ke publik.
+ExecStart=/home/amamiya/.opencode/bin/opencode serve --hostname 0.0.0.0 --port 4097
 Restart=on-failure
 RestartSec=5
 # Pengerasan murah pengganti container untuk instance publik:

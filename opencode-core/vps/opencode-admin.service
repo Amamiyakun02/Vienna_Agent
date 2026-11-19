@@ -7,6 +7,11 @@ Wants=docker.service
 Type=simple
 User=amamiya
 Environment=BACKEND_DIR=/home/amamiya/apps/Vienna_Agent
+# Backend di container menjangkau serve ini lewat gateway Docker,
+# bukan loopback — dengarkan semua antarmuka. UFW VPS membatasi
+# 4096/4097 hanya untuk subnet Docker (172.16.0.0/12); port ini
+# TIDAK dibuka ke publik.
+Environment=OPENCODE_ADMIN_HOSTNAME=0.0.0.0
 ExecStart=/home/amamiya/apps/Vienna_Agent/opencode-core/start-admin.sh
 Restart=on-failure
 RestartSec=5

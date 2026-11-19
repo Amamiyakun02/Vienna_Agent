@@ -11,6 +11,13 @@ set -euo pipefail
 BACKEND_DIR="${BACKEND_DIR:-$HOME/apps/Vienna_Agent}"
 WORKSPACE_DIR="$BACKEND_DIR/admin-workspace"
 PORT="${OPENCODE_ADMIN_PORT:-4096}"
+# Alamat dengar serve. Bawaan 127.0.0.1 (laptop: backend bare-metal).
+# Di VPS backend hidup di container dan menjangkau serve lewat
+# gateway Docker (host.docker.internal = IP 172.x, BUKAN loopback),
+# jadi unit systemd VPS menyetel OPENCODE_ADMIN_HOSTNAME=0.0.0.0 —
+# aman karena UFW VPS hanya membuka 4096/4097 untuk subnet Docker
+# (172.16.0.0/12); dari internet port ini tetap tertutup.
+HOST="${OPENCODE_ADMIN_HOSTNAME:-127.0.0.1}"
 
 export PATH="$HOME/.opencode/bin:$PATH"
 
@@ -34,4 +41,4 @@ export OPENCODE_CONFIG="$BACKEND_DIR/opencode-core/admin/opencode.jsonc"
 # Pisahkan DB sesi admin dari sesi publik/pribadi:
 export XDG_DATA_HOME="$WORKSPACE_DIR/.data"
 cd "$WORKSPACE_DIR"
-exec opencode serve --hostname 127.0.0.1 --port "$PORT"
+exec opencode serve --hostname "$HOST" --port "$PORT"

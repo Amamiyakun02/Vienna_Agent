@@ -68,3 +68,22 @@ curl -s -u opencode:$OPENCODE_SERVER_PASSWORD http://127.0.0.1:4096/api/model/de
 curl -s -u opencode:$OPENCODE_SERVER_PASSWORD http://127.0.0.1:4097/api/model/default  # inception/...
 # lalu 1 chat pendek per instance lewat backend :8000
 ```
+
+## 5. Jembatan container → serve (WAJIB di VPS, terverifikasi 19 Nov 2026)
+
+Backend di container menjangkau serve lewat `host.docker.internal`
+= IP gateway Docker (172.x), **bukan** loopback host. Serve yang
+hanya mendengarkan `127.0.0.1` tidak akan terjangkau dari container
+(gejala: Assistant membalas "opencode serve tidak terjangkau",
+curl dari container = `000`, dari host = `401`). Karena itu:
+
+- Kedua unit mendengarkan `0.0.0.0` (publik langsung di unit-nya;
+  admin lewat `OPENCODE_ADMIN_HOSTNAME` yang dibaca
+  `opencode-core/start-admin.sh`, bawaan tetap `127.0.0.1` untuk
+  laptop).
+- UFW VPS membuka port ini HANYA untuk subnet Docker:
+  `sudo ufw allow from 172.16.0.0/12 to any port 4096,4097 proto tcp`
+  Dari internet 4096/4097 tetap tertutup (UFW default deny) —
+  verifikasi dari luar wajib sesudah perubahan bind.
+- Cek jembatan: `docker compose exec backend curl -s -o /dev/null -w '%{http_code}' http://host.docker.internal:4097/api/model/default`
+  → `401` berarti tembus (serve meminta autentikasi).
