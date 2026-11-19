@@ -53,11 +53,21 @@ services:
       OPENCODE_PUBLIC_BASE_URL: http://host.docker.internal:4097
       # Salinan live config agent publik di host (lihat volumes).
       OPENCODE_PUBLIC_DIR: /app/agent-public
+      # Direktori kerja agent admin di host (lihat volumes) — backend
+      # membaca dari sini file yang dibuat/diubah agent untuk
+      # dikembalikan sebagai lampiran "files" di akhir giliran chat.
+      OPENCODE_ADMIN_DIR: /app/admin-workspace
     volumes:
       # Publish dashboard harus menulis ke file yang dibaca serve di
       # host, bukan ke salinan di dalam image.
       - ./opencode-core:/app/opencode-core
       - ../agent-public:/app/agent-public
+      # Dibaca backend untuk lampiran file hasil kerja agent admin.
+      # Foldernya WAJIB sudah ada sebelum `docker compose up` pertama
+      # (dibuat start-admin.sh di host / mkdir manual) — bila Docker
+      # yang membuatnya, folder jadi milik root dan serve di host
+      # tidak bisa menulis ke dalamnya.
+      - ./admin-workspace:/app/admin-workspace
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

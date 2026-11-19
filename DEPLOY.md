@@ -52,12 +52,17 @@ Arsitektur produksi (keputusan 13–15 Nov 2026):
    - MCPServer punya .env SENDIRI di foldernya (MONGODB_URI dsb.) —
      buat juga dari contoh di repo MCPServer, chmod 600.
    - Lalu: `chmod 600 .env` untuk keduanya.
-3. Naikkan tumpukan: `docker compose up -d --build`
-4. Pasang opencode serve: ikuti `opencode-core/vps/DEPLOY-VPS.md`
+3. Pastikan folder kerja agent admin sudah ada di host SEBELUM compose
+   pertama kali naik: `mkdir -p ~/apps/Vienna_Agent/admin-workspace`
+   (folder ini di-bind-mount ke backend untuk lampiran file hasil kerja
+   agent; bila Docker yang membuatnya, folder jadi milik root dan serve
+   di host tidak bisa menulis ke dalamnya).
+4. Naikkan tumpukan: `docker compose up -d --build`
+5. Pasang opencode serve: ikuti `opencode-core/vps/DEPLOY-VPS.md`
    (unit systemd `opencode-admin` + `opencode-public`; keduanya membaca
    `.env` yang sama lewat `EnvironmentFile=`) lalu
    `sudo systemctl enable --now opencode-admin opencode-public`.
-5. Verifikasi:
+6. Verifikasi:
    - `docker compose ps` — backend up, postgres & redis healthy.
    - `curl http://127.0.0.1:8000/health` → `{"status":"ok"}`
    - `curl http://127.0.0.1:8000/v1/engines` — lyber & opencode available.

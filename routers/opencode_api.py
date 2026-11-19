@@ -30,6 +30,7 @@ import asyncio
 import json
 import os
 import time
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException
@@ -104,6 +105,94 @@ def _target(role: str | None) -> tuple[str, str, str, str]:
     if (role or "").strip().lower() == "admin":
         return "admin", ADMIN_BASE_URL, ADMIN_AGENT, _db_admin_model_default() or ADMIN_MODEL
     return "public", PUBLIC_BASE_URL, PUBLIC_AGENT, _db_model_default() or DEFAULT_MODEL
+
+
+# --- Lampiran file hasil kerja agent -------------------------------------
+# File yang dibuat/diubah agent di direktori kerjanya dikembalikan ke
+# klien di akhir giliran (kunci "files" pada event done / respons chat):
+# pengunjung menerima HASILNYA, bukan cuma cerita agent. Jalur file
+# ditangkap dari event session.tool.called (input tool write/edit) —
+# bukan snapshot folder, supaya file sesi lain yang berjalan bersamaan
+# tidak ikut terbawa. Isi dibatasi agar SSE tidak meledak; file biner /
+# terlalu besar dikembalikan sebagai metadata saja (content_omitted).
+FILE_RETURN_MAX_BYTES = 65536
+_FILE_TOOLS = {"write", "edit"}
+
+
+def _role_root(role: str) -> Path | None:
+    """Direktori kerja instance serve untuk satu role, dari sisi backend.
+
+    Publik: OPENCODE_PUBLIC_DIR (di VPS diisi compose, menunjuk bind
+    mount folder agent publik di host); cadangan ~/agent-public (letak
+    bawaan laptop). Admin: OPENCODE_ADMIN_DIR; cadangan folder
+    admin-workspace/ di repo ini (di container VPS = /app/admin-workspace,
+    bind mount di compose). None bila foldernya tidak ada — fitur
+    lampiran mati diam-diam, chat tetap jalan.
+    """
+    if role == "admin":
+        env = os.getenv("OPENCODE_ADMIN_DIR", "").strip()
+        root = Path(env) if env else Path(__file__).resolve().parents[1] / "admin-workspace"
+    else:
+        env = os.getenv("OPENCODE_PUBLIC_DIR", "").strip()
+        root = Path(env) if env else Path.home() / "agent-public"
+    return root if root.is_dir() else None
+
+
+def _collect_files(role: str, raw_paths: list[str]) -> list[dict]:
+    """Baca isi file-file yang disentuh agent pada giliran ini.
+
+    Jalur dari tool adalah jalur absolut MESIN HOST serve; backend di
+    container melihat folder yang sama lewat bind mount di jalur lain.
+    Karena itu, bila jalur apa adanya tidak ditemukan, coba gabungkan
+    potongan ekor jalurnya ke root role sampai ketemu — lalu wajibkan
+    hasil akhir tetap di dalam root (tidak boleh keluar sandbox).
+    """
+    root = _role_root(role)
+    if root is None:
+        return []
+    root_real = root.resolve()
+    out: list[dict] = []
+    seen: set[Path] = set()
+    for raw in raw_paths:
+        if not raw:
+            continue
+        p = Path(str(raw))
+        candidates = [p] if p.is_absolute() else [root_real / p]
+        if p.is_absolute():
+            parts = p.parts
+            candidates += [root_real.joinpath(*parts[i:]) for i in range(1, min(len(parts), 7))]
+        resolved = None
+        for cand in candidates:
+            try:
+                rp = cand.resolve()
+            except Exception:
+                continue
+            if rp.is_file() and root_real in rp.parents:
+                resolved = rp
+                break
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            size = resolved.stat().st_size
+            data = resolved.read_bytes() if size <= FILE_RETURN_MAX_BYTES else None
+        except Exception:
+            continue
+        entry = {
+            "name": resolved.name,
+            "path": resolved.relative_to(root_real).as_posix(),
+            "size": size,
+            "content": None,
+        }
+        if data is None:
+            entry["content_omitted"] = "too_large"
+        else:
+            try:
+                entry["content"] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                entry["content_omitted"] = "binary"
+        out.append(entry)
+    return out
 
 
 def _admin_gate(role: str | None, x_admin_token: str | None) -> str | None:
@@ -479,6 +568,14 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     last_user_idx = max((i for i, m in enumerate(messages) if m.get("type") == "user"), default=-1)
     turn = [m for m in messages[last_user_idx + 1:] if m.get("type") == "assistant"]
     tools = [p.get("name") for m in turn for p in (m.get("content") or []) if p.get("type") == "tool"]
+    file_paths = []
+    for m in turn:
+        for p in (m.get("content") or []):
+            if p.get("type") == "tool" and p.get("name") in _FILE_TOOLS:
+                inp = p.get("input") or (p.get("state") or {}).get("input") or {}
+                fp = inp.get("path") or inp.get("filePath")
+                if fp:
+                    file_paths.append(fp)
 
     idle = next((m for m in reversed(messages) if m.get("type") == "idle"), None)
     if idle and idle.get("outcome") == "failed":
@@ -526,6 +623,7 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         "tools_used": tools,
         "agent": assistant.get("agent"),
         "model": model,
+        "files": _collect_files(role, file_paths),
     }
 
 
@@ -591,6 +689,8 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
     async def gen():
         yield _sse({"meta": {"session_id": session_id}})
         tools_used: list[str] = []
+        call_names: dict[str, str] = {}
+        touched_paths: list[str] = []
         model_id: str | None = None
         usage = None
         timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
@@ -685,6 +785,8 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                             elif etype == "session.tool.input.started":
                                 name = data.get("name")
                                 if name:
+                                    if data.get("id"):
+                                        call_names[data["id"]] = name
                                     tools_used.append(name)
                                     yield _sse({"meta": {"tool": name}})
                                     if name == "question" and not body.hitl:
@@ -693,6 +795,16 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                         _rec_turn("error")
                                         yield _sse({"error": "agent meminta jawaban interaktif (tool question) — tidak bisa dijawab lewat jalur web ini; pakai agent yang dilarang memakai tool interaktif (lihat opencode-core/) atau kirim hitl=true dan jawab form-nya"})
                                         return
+                            elif etype == "session.tool.called":
+                                # Input tool lengkap (event "started" hanya
+                                # membawa nama). Untuk write/edit, tangkap
+                                # jalur file-nya: di akhir giliran isi file
+                                # dikembalikan ke klien sebagai lampiran.
+                                if call_names.get(data.get("id")) in _FILE_TOOLS:
+                                    inp = data.get("input") or {}
+                                    fp = inp.get("path") or inp.get("filePath")
+                                    if fp:
+                                        touched_paths.append(fp)
                             elif etype == "session.step.started":
                                 model_id = (data.get("model") or {}).get("id") or model_id
                             elif etype == "session.usage.updated":
@@ -723,9 +835,10 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
             _rec_turn("error")
             yield _sse({"error": f"aliran event opencode terputus: {exc}"})
             return
+        files = _collect_files(role, touched_paths)
         print(
             f"[OPENCODE] selesai session={session_id} model={model_id} "
-            f"tools={tools_used} durasi={time.monotonic() - started:.1f}dtk",
+            f"tools={tools_used} files={len(files)} durasi={time.monotonic() - started:.1f}dtk",
             flush=True,
         )
         _record_turn(
@@ -739,6 +852,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
             "tools_used": tools_used,
             "model": model_id,
             "usage": usage,
+            "files": files,
         })
 
     return StreamingResponse(

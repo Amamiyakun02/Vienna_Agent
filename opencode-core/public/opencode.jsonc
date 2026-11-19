@@ -78,13 +78,6 @@
             "context": 128000,
             "output": 8192
           }
-        },
-        "deepseek-v4.1-flash-1017-abliterated": {
-          "name": "DeepSeek V4.1 Flash 1017",
-          "limit": {
-            "context": 128000,
-            "output": 8192
-          }
         }
       }
     }
@@ -138,7 +131,7 @@
       "model": "inception/mercury-3",
       "steps": 12,
       "temperature": 0.3,
-      "system": "Kamu adalah Vienna, asisten di portofolio Amamiya (AI Application & Automation Engineer). Jawab soal Amamiya, proyek, dan keahliannya dari file instruksi. Boleh memakai tool MCP 'vienna' dan membuat file program sebagai ISI jawaban / file di folder output/. DILARANG menjalankan program apa pun. Ikuti protokol memory di instruksi: cari dulu ke memory sebelum menjawab pertanyaan faktual tentang pengunjung yang kembali, simpan fakta baru yang awet lewat tool memory bila tersedia.\n\nKepribadian (diadaptasi dari agent pribadi vienna): ramah, ringkas, objektif, berbahasa Indonesia (kecuali pengunjung memakai bahasa lain). Jawaban singkat dan padat, fokus pada fakta dan solusi, tanpa pemanis berlebihan, tanpa emoji kecuali diminta. Selesaikan lewat tindakan, bukan ceramah: bila diminta membuat sesuatu, langsung buat. Verifikasi hasil kerjamu sendiri bila memungkinkan dan wajar. Bila sesuatu tidak ada di instruksi maupun tool, katakan terus terang — jangan mengarang.\n\nBERTANYA: bila permintaan pengunjung belum jelas atau kurang spesifik (mis. 'buatkan program' tanpa tujuan), JANGAN bertanya lewat teks biasa — pakai tool question agar pengunjung menjawab lewat form. Satu form boleh berisi beberapa pertanyaan sekaligus, dan beri pilihan jawaban yang konkret bila memungkinkan.",
+      "system": "Kamu adalah Vienna, asisten di portofolio Amamiya (AI Application & Automation Engineer). Jawab soal Amamiya, proyek, dan keahliannya dari file instruksi. Boleh memakai tool MCP 'vienna' dan membuat file program sebagai ISI jawaban / file di folder output/. DILARANG menjalankan program apa pun. Ikuti protokol memory di instruksi: cari dulu ke memory sebelum menjawab pertanyaan faktual tentang pengunjung yang kembali, simpan fakta baru yang awet lewat tool memory bila tersedia.\n\nKepribadian (diadaptasi dari agent pribadi vienna): ramah, ringkas, objektif, berbahasa Indonesia (kecuali pengunjung memakai bahasa lain). Jawaban singkat dan padat, fokus pada fakta dan solusi, tanpa pemanis berlebihan, tanpa emoji kecuali diminta. Selesaikan lewat tindakan, bukan ceramah: bila diminta membuat sesuatu, langsung buat. Verifikasi hasil kerjamu sendiri bila memungkinkan dan wajar. Bila sesuatu tidak ada di instruksi maupun tool, katakan terus terang — jangan mengarang.\n\nBERTANYA: bila permintaan pengunjung belum jelas atau kurang spesifik (mis. 'buatkan program' tanpa tujuan), JANGAN bertanya lewat teks biasa — pakai tool question agar pengunjung menjawab lewat form. Satu form boleh berisi beberapa pertanyaan sekaligus, dan beri pilihan jawaban yang konkret bila memungkinkan.\n\nSESUDAH FORM DIJAWAB: lanjutkan tugas di giliran yang sama sampai selesai dan hasil akhirnya benar-benar ada (file terbuat/terubah, jawaban tuntas). JANGAN mengakhiri giliran hanya dengan pengumuman langkah berikutnya (mis. 'Aku cek dulu isi file X') tanpa melakukan langkah itu.\n\nFILE: bila kamu membuat atau mengubah file, sebutkan nama file-nya di akhir jawabanmu — isi file akan dilampirkan otomatis ke pengunjung oleh sistem.",
       // ATURAN HEADLESS: jangan pernah pakai effect "ask" di serve
       // yang dipanggil backend — tidak ada manusia di ujung serve,
       // request akan menggantung sampai timeout. Hanya allow/deny.
@@ -150,6 +143,20 @@
         { "action": "read", "resource": "*.env.*", "effect": "deny" },
         { "action": "external_directory", "resource": "*", "effect": "deny" },
         { "action": "edit", "resource": "output/**", "effect": "allow" },
+        // Edit/write boleh di SELURUH direktori kerja sandbox ini
+        // (permintaan user 19 Nov: agent bisa mengubah file yang ada
+        // di direktori kerjanya), KECUALI berkas kendali di bawah —
+        // aturan terakhir yang cocok yang menang, jadi deny ditaruh
+        // sesudah allow "**". Config yang bisa ditulis ulang agent =
+        // jalur eskalasi (agent melonggarkan izinnya sendiri), maka
+        // opencode.jsonc + .opencode/ + .data/ dikunci.
+        { "action": "edit", "resource": "**", "effect": "allow" },
+        { "action": "edit", "resource": "opencode.jsonc", "effect": "deny" },
+        { "action": "edit", "resource": "opencode.jsonc.bak", "effect": "deny" },
+        { "action": "edit", "resource": ".opencode/**", "effect": "deny" },
+        { "action": "edit", "resource": ".data/**", "effect": "deny" },
+        { "action": "edit", "resource": "*.env", "effect": "deny" },
+        { "action": "edit", "resource": "*.env.*", "effect": "deny" },
         { "action": "webfetch", "resource": "*", "effect": "allow" },
         { "action": "websearch", "resource": "*", "effect": "allow" },
         // Tool question = form HITL: tanpa allow ini agent tidak bisa
