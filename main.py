@@ -34,17 +34,11 @@ _JWT_FROM_ENV = bool(os.getenv("JWT_SECRET"))
 JWT_ALGORITHM = "HS256"
 
 _DEFAULT_CORS_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
+
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:3100",
     "http://127.0.0.1:3100",
-    "https://amamiyakun02.github.io",
-    "https://smart-guide-ai-agent.vercel.app",
-    "https://lina-deals.vercel.app",
 ]
 # Deploy: tambah origin via env CORS_ALLOW_ORIGINS (comma-separated)
 # agar tak perlu edit kode tiap ada frontend baru.
