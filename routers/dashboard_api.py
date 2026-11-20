@@ -19,8 +19,10 @@ import hmac
 import os
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
+
+from services.rate_limit import enforce as _rate_enforce
 
 router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
 
@@ -69,7 +71,10 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/login")
-async def dashboard_login(payload: LoginRequest):
+async def dashboard_login(payload: LoginRequest, request: Request):
+    # Penahan brute-force (audit 20 Nov 2026): maks 10 percobaan per
+    # 5 menit per IP+username; percobaan gagal juga dicatat di log.
+    _rate_enforce(request, "dashboard-login", payload.username, 10, 300)
     env_user = os.getenv("DASHBOARD_ADMIN_USER", "")
     env_pass = os.getenv("DASHBOARD_ADMIN_PASSWORD", "")
     if not env_user or not env_pass or not _secret():
@@ -81,6 +86,7 @@ async def dashboard_login(payload: LoginRequest):
         payload.password, env_pass
     )
     if not ok:
+        print(f"[DASHBOARD] login gagal user={payload.username!r}", flush=True)
         raise HTTPException(status_code=401, detail="Username atau password salah.")
     return {
         "token": _issue_token(env_user),

@@ -3,14 +3,17 @@ import secrets
 import hashlib
 import base64
 import hmac
+import string
 import urllib.request
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from bson import ObjectId
 from pydantic import BaseModel
 import jwt
+
+from services.rate_limit import enforce as _rate_enforce
 
 # Cryptography primitives for Google RSA JWK signature verification
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
@@ -75,6 +78,44 @@ def verify_password(password: str, hashed: str) -> bool:
         return hmac.compare_digest(actual_key, expected_key)
     except Exception:
         return False
+
+
+# Hash boneka untuk menyamakan waktu respons login saat email tidak
+# terdaftar (audit 20 Nov 2026): tanpa ini, email terdaftar menjawab
+# lebih lambat (PBKDF2 berjalan) daripada email tak dikenal, sehingga
+# keberadaan akun bisa ditebak dari waktu respons.
+_DUMMY_HASH = hash_password("bukan-password-sungguhan")
+
+
+def _bearer_user_id(authorization: Optional[str]) -> str:
+    """User id dari header 'Authorization: Bearer <JWT>'; 401 bila tak sah.
+
+    Endpoint yang mengubah data milik user (update-profile,
+    migrate-session) WAJIB lewat sini — sebelumnya keduanya menerima
+    user_id mentah dari body tanpa bukti kepemilikan apa pun, jadi
+    siapa pun bisa mengganti password akun orang lain (audit 20 Nov).
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token akses wajib disertakan.",
+        )
+    try:
+        payload = jwt.decode(
+            authorization[7:].strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM]
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token akses tidak valid atau sudah kedaluwarsa.",
+        )
+    uid = payload.get("id")
+    if not uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token akses tidak memuat identitas user.",
+        )
+    return str(uid)
 
 async def verify_firebase_id_token(token: str) -> dict:
     """Verify Firebase ID Token signature, audience, and issuer."""
@@ -157,12 +198,13 @@ async def verify_firebase_id_token(token: str) -> dict:
 # ──────────────────────────────────────────────
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register_user(payload: UserRegisterRequest):
+async def register_user(payload: UserRegisterRequest, request: Request):
     """
     Registers a new member (customer) to the gadget store.
     Encrypts password securely and returns a JWT access token.
     """
     email_clean = payload.email.strip().lower()
+    _rate_enforce(request, "auth-register", email_clean, 10, 3600)
     
     existing = await get_user_by_email(email_clean)
     if existing:
@@ -216,14 +258,16 @@ async def register_user(payload: UserRegisterRequest):
     }
 
 @router.post("/login")
-async def login_user(payload: UserLoginRequest):
+async def login_user(payload: UserLoginRequest, request: Request):
     """
     Authenticates a user using email & password and returns a JWT access token.
     """
     email_clean = payload.email.strip().lower()
-    
+    _rate_enforce(request, "auth-login", email_clean, 20, 300)
+
     user = await get_user_by_email(email_clean)
     if not user:
+        verify_password(payload.password, _DUMMY_HASH)  # samakan waktu respons
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email atau kata sandi Anda salah."
@@ -334,10 +378,21 @@ async def login_google(payload: GoogleLoginRequest):
     }
 
 @router.post("/migrate-session")
-async def migrate_session(payload: SessionMigrateRequest):
+async def migrate_session(
+    payload: SessionMigrateRequest,
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Migrates chat sessions from anonymous status to a registered customer.
     """
+    # Bukti kepemilikan (audit 20 Nov 2026): sesi hanya boleh dimigrasikan
+    # ke akun milik pemanggil sendiri (dari JWT), bukan user_id bebas.
+    uid = _bearer_user_id(authorization)
+    if payload.user_id != uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User ID tidak cocok dengan token akses.",
+        )
     if not payload.temp_session_id or not payload.user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -366,10 +421,22 @@ class UpdateProfileRequest(BaseModel):
 
 
 @router.post("/update-profile")
-async def update_profile(payload: UpdateProfileRequest):
+async def update_profile(
+    payload: UpdateProfileRequest,
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Updates registered customer's name and WhatsApp number.
     """
+    # Bukti kepemilikan (audit 20 Nov 2026): endpoint ini bisa mengganti
+    # PASSWORD akun — wajib JWT dan hanya untuk akun sendiri. Cek ini
+    # sengaja SEBELUM akses database.
+    uid = _bearer_user_id(authorization)
+    if payload.user_id != uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User ID tidak cocok dengan token akses.",
+        )
     try:
         user_oid = ObjectId(payload.user_id)
     except Exception:
@@ -426,97 +493,72 @@ async def update_profile(payload: UpdateProfileRequest):
 class ResetPasswordWaRequest(BaseModel):
     email: str
 
-
 @router.post("/reset-password-wa")
-async def reset_password_wa(payload: ResetPasswordWaRequest):
+async def reset_password_wa(payload: ResetPasswordWaRequest, request: Request):
     """
-    Generates a temporary 8-character password, updates it in MongoDB,
-    and sends it to the user's registered WhatsApp number via Fonnte.
+    Generates a temporary password and sends it to the staff member's
+    registered WhatsApp number via Fonnte.
+
+    Audit 20 Nov 2026: respons SELALU generik — keberadaan email, role,
+    dan keberhasilan kirim tidak boleh bisa ditebak dari respons
+    (mencegah enumerasi akun staf). Password di database hanya diganti
+    SESUDAH pesan WA terkirim, supaya kegagalan gateway tidak mengunci
+    akun staf dengan password yang tidak diketahui siapa pun.
     """
     email_clean = payload.email.strip().lower()
-    
-    # 1. Find user in MongoDB
+    _rate_enforce(request, "auth-reset-wa", email_clean, 5, 3600)
+    generic = {
+        "status": "success",
+        "message": "Bila email terdaftar sebagai akun staf dan memiliki nomor WhatsApp, password sementara akan dikirim ke nomor tersebut.",
+    }
+
     user = await get_user_by_email(email_clean)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Email tidak terdaftar."
-        )
-        
-    # 2. Check if user is superadmin or sales
-    if user.get("role") not in ["superadmin", "sales"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Akses ditolak: Hanya staf yang dapat meminta reset password."
-        )
-        
-    # 3. Get registered WhatsApp/phone number
+    if not user or user.get("role") not in ["superadmin", "sales"]:
+        return generic
     phone = user.get("phone")
     if not phone:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nomor WhatsApp tidak terdaftar untuk akun ini. Silakan hubungi Administrator Utama."
-        )
-        
+        return generic
+
     phone_clean = phone.strip()
     if phone_clean.startswith("0"):
         phone_clean = "62" + phone_clean[1:]
-        
-    # 4. Generate random temporary password
-    import random
-    import string
+
+    # Password sementara dari PRNG kriptografis (bukan modul random).
     import httpx
-    
-    temp_pass = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    hashed = hash_password(temp_pass)
-    
-    # Update password in database
-    await users_col.update_one(
-        {"_id": user["_id"]},
-        {"$set": {"password_hash": hashed, "updated_at": datetime.now(timezone.utc)}}
-    )
-    
-    # 5. Send WhatsApp message via Fonnte
+
+    temp_pass = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10))
+
     message = (
         f"Halo {user.get('name')},\n\n"
         f"Anda telah meminta reset password untuk masuk ke Dashboard IRIN CELLULAR.\n\n"
         f"Password sementara Anda adalah: {temp_pass}\n\n"
         f"Silakan masuk menggunakan password tersebut dan segera ganti kata sandi Anda di menu Manajemen Data demi keamanan akun Anda."
     )
-    
+
     fonnte_token = os.getenv("WHATSAPP_GATEWAY_TOKEN")
     if not fonnte_token:
         print("[ERROR] Token Fonnte (WHATSAPP_GATEWAY_TOKEN) tidak ditemukan di environment.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Sistem WhatsApp Gateway tidak terkonfigurasi di server."
-        )
-        
-    url = "https://api.fonnte.com/send"
-    headers = {
-        "Authorization": fonnte_token
-    }
-    payload_data = {
-        "target": phone_clean,
-        "message": message
-    }
-    
+        return generic
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, data=payload_data, timeout=15.0)
+            response = await client.post(
+                "https://api.fonnte.com/send",
+                headers={"Authorization": fonnte_token},
+                data={"target": phone_clean, "message": message},
+                timeout=15.0,
+            )
             res_json = response.json()
             if not res_json.get("status"):
                 print(f"[ERROR] Fonnte API failure: {res_json}")
-                raise Exception(res_json.get("reason", "Gagal mengirim pesan via Fonnte"))
+                return generic
     except Exception as e:
         print(f"[ERROR] Gagal mengirim pesan WA via Fonnte: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Gagal mengirim pesan WhatsApp reset password: {str(e)}"
-        )
-        
-    return {
-        "status": "success",
-        "message": f"Password sementara berhasil dikirim ke nomor WhatsApp Anda ({phone})."
-    }
+        return generic
 
+    # Terkirim — baru sekarang password di database diganti.
+    await users_col.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password_hash": hash_password(temp_pass), "updated_at": datetime.now(timezone.utc)}},
+    )
+    return generic

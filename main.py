@@ -8,7 +8,7 @@ import html
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from fastapi import FastAPI, Body, BackgroundTasks, Header, HTTPException
+from fastapi import FastAPI, Body, BackgroundTasks, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -166,8 +166,16 @@ app.include_router(anime_router)
 from routers.spotify_api import router as spotify_router
 app.include_router(spotify_router)
 
+from routers.dashboard_api import require_admin as _require_admin
+
 from routers.admin import router as admin_router
-app.include_router(admin_router)
+
+# AUDIT 20 Nov 2026: router legacy ini sebelumnya terpasang TANPA
+# gerbang apa pun — siapa pun bisa membaca semua user Mongo (termasuk
+# password_hash), membuat/mengubah/menghapus user, membaca semua
+# pesan chat, dan mengubah dokumen RAG. Kini seluruhnya digerbang
+# token admin dashboard yang sama (header X-Admin-Token).
+app.include_router(admin_router, dependencies=[Depends(_require_admin)])
 
 from routers.gemini_live import router as gemini_live_router
 app.include_router(gemini_live_router)
@@ -249,7 +257,7 @@ async def keep_alive_spaces():
             print(f"[KEEP-ALIVE WARNING] HTTP client initialization failed: {e}")
         await asyncio.sleep(1500)  # 25 minutes interval
 
-@app.post("/v1/github/sync")
+@app.post("/v1/github/sync", dependencies=[Depends(_require_admin)])
 async def trigger_github_sync(background_tasks: BackgroundTasks):
     """
     Trigger manual synchronization of GitHub repositories in the background.
