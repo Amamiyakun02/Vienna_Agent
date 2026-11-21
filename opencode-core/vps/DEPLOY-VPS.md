@@ -26,7 +26,6 @@ seluruh isi laptop. Tata letak VPS: `~/apps/Vienna_Agent` dan
 | `opencode-core/public/opencode.jsonc` | `~/apps/agent-public/opencode.jsonc` |
 | `opencode-core/admin/opencode.jsonc` | `~/apps/Vienna_Agent/opencode.jsonc` |
 | `opencode-core/shared-instructions/profile-amamiya.md` | `~/apps/agent-public/.opencode/instructions/` DAN `~/apps/Vienna_Agent/.opencode/instructions/` |
-| `opencode-core/shared-instructions/memory-protocol.md` | sama, ke kedua folder `instructions/` |
 | `opencode-core/vps/opencode-admin.service` | `/etc/systemd/system/opencode-admin.service` |
 | `opencode-core/vps/opencode-public.service` | `/etc/systemd/system/opencode-public.service` |
 
@@ -44,8 +43,7 @@ Aktifkan: `sudo systemctl daemon-reload && sudo systemctl enable --now opencode-
       tambah `ports: ["127.0.0.1:8001:8001"]` agar serve di host
       bisa menjangkau MCP. Tanpa ini blok `mcp.servers` di config
       tidak akan tersambung di VPS (di laptop tesnya beda jalur).
-- [ ] Kode `MCPServer` — bila selama tes ditambah tool
-      `memory_save`/`memory_recall`; folder ini memang wajib ada
+- [ ] Kode `MCPServer` — folder ini memang wajib ada
       di `~/apps/MCPServer` untuk build container mcp.
 - [ ] Perubahan lain di Vienna_Agent selama tes (commit seperti biasa).
 

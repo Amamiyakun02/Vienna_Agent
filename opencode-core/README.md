@@ -14,7 +14,7 @@ instance**. Folder ini isinya file itu.
 | Memory sesi (riwayat chat) | Session persisten di SQLite opencode; backend cukup simpan `session_id` per user | otomatis |
 | Memory konteks panjang | Compaction otomatis (ringkas + simpan ekor percakapan) | `compaction` di jsonc |
 | Memory statis (profil, aturan) | File instruksi dimuat ke setiap sesi baru | `instructions` + `.opencode/instructions/*.md` |
-| Memory dinamis (fakta antar-sesi) | Tool MCP `memory_recall`/`memory_save` di MCP server-mu (Mongo/Qdrant yang sudah ada) | protokol di `shared-instructions/memory-protocol.md` |
+| Memory dinamis (fakta antar-sesi) | SENGAJA tidak dipasang untuk instance project (publik & admin) — keputusan user 21 Nov 2026: akses memory/vault hanya milik instance pribadi user | — |
 | Pengetahuan dokumen | RAG Qdrant, sudah jadi tool MCP | MCP server |
 | Tools eksternal | MCP server lokal (stdio) / remote (HTTP) | blok `mcp.servers` di jsonc |
 | Tools bawaan (read/edit/bash/web) | Permission per agent: `allow`/`deny` per aksi+resource | `agents.<nama>.permissions` |
@@ -102,12 +102,12 @@ Untuk dua instance, perubahan terkecilnya:
    Mercury tetap mati total setelah **28 Des 2026** — config ini
    membuat penggantinya cukup ganti satu baris `model` +
    blok provider, bukan ganti kode.
-3. **Tool memory di MCP server**: protokolnya sudah ditulis, tapi
-   apakah MCP server-mu sudah punya `memory_save`/`memory_recall`
-   belum terkonfirmasi di folder ini. Bila belum, itu SATU-SATUNYA
-   kode baru yang perlu ditulis (±2 tool di MCP server, memakai
-   Mongo + embedding yang sudah ada) — bukan di backend, bukan
-   agent loop baru.
+3. **Tool memory di MCP server**: SENGAJA tidak dibangun untuk
+   instance project (keputusan user 21 Nov 2026) — protokol memory
+   lama sudah dicabut dari instruksi bersama dan prompt kedua
+   agent. Akses memory/vault hanya untuk instance pribadi user;
+   kebutuhan serupa di masa depan akan datang sebagai fitur skill
+   custom tersendiri, bukan protokol diam-diam.
 4. Format config ini V2 (serve server v2.1.4 / laptop v2.2.2).
    Instalasi V1 lama (1.18.x, backup 26 Okt) memakai format lain
    (`agent`, `mcp` langsung, `permission` objek) dan akan mengabaikan
