@@ -908,10 +908,30 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                             await queue.put(None)
 
                     task = asyncio.create_task(producer())
+                    # Heartbeat diukur dari terakhir kali DATA TERKIRIM ke
+                    # klien, bukan dari aktivitas antrean. Serve rajin
+                    # mengirim event yang tidak diteruskan ke klien
+                    # (usage, langkah sesi lain, dsb.) — event semacam itu
+                    # mengulur timer lama walau klien tidak menerima satu
+                    # byte pun, dan insiden 21 Nov 2026 (browser putus pada
+                    # ±98 dtk, ERR_INCOMPLETE_CHUNKED_ENCODING) menunjukkan
+                    # celah sepi 25+ dtk di sisi klien. Kini: maksimal
+                    # ±15 dtk tanpa kiriman, lalu komentar SSE ": ping"
+                    # (diabaikan semua parser klien). Berlaku juga selama
+                    # masa tunggu HITL — stream memang sepi menurut desain
+                    # saat admin menjawab form.
+                    last_sent = time.monotonic()
+
+                    def _out(payload: str) -> str:
+                        nonlocal last_sent
+                        last_sent = time.monotonic()
+                        return payload
+
                     try:
                         while True:
                             try:
-                                item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                                wait = max(0.1, 15.0 - (time.monotonic() - last_sent))
+                                item = await asyncio.wait_for(queue.get(), timeout=wait)
                             except asyncio.TimeoutError:
                                 if time.monotonic() - started > TIMEOUT_S:
                                     await abort_best_effort()
@@ -919,7 +939,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                     _rec_turn("error")
                                     yield _sse({"error": f"agent tidak selesai dalam {int(TIMEOUT_S)} detik — giliran dihentikan"})
                                     return
-                                yield ": hb\n\n"  # heartbeat: jaga aliran dari timeout proxy
+                                yield _out(": ping\n\n")  # heartbeat: jaga aliran dari timeout proxy
                                 continue
                             if item is None:
                                 break  # aliran event serve berakhir
@@ -943,25 +963,25 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                 # Teruskan definisinya; klien menjawab lewat
                                 # POST /sessions/{id}/forms/{form_id}/reply dan
                                 # agent melanjutkan di aliran yang sama.
-                                yield _sse({"meta": {"hitl_form": form}})
+                                yield _out(_sse({"meta": {"hitl_form": form}}))
                             elif etype == "form.cancelled" and body.hitl:
-                                yield _sse({"meta": {"hitl_form_cancelled": data.get("id")}})
+                                yield _out(_sse({"meta": {"hitl_form_cancelled": data.get("id")}}))
                             elif etype == "permission.asked" and body.hitl:
                                 # Agent meminta persetujuan aksi (effect "ask").
                                 # Klien menjawab lewat POST
                                 # /sessions/{id}/permissions/{request_id}/reply.
-                                yield _sse({"meta": {"hitl_permission": data}})
+                                yield _out(_sse({"meta": {"hitl_permission": data}}))
                             elif etype == "session.text.delta":
                                 delta = data.get("delta") or ""
                                 if delta:
-                                    yield _sse({"text": delta})
+                                    yield _out(_sse({"text": delta}))
                             elif etype == "session.tool.input.started":
                                 name = data.get("name")
                                 if name:
                                     if data.get("id"):
                                         call_names[data["id"]] = name
                                     tools_used.append(name)
-                                    yield _sse({"meta": {"tool": name}})
+                                    yield _out(_sse({"meta": {"tool": name}}))
                                     if name == "question" and not body.hitl:
                                         await abort_best_effort()
                                         print(f"[OPENCODE] dihentikan session={session_id}: tool question tanpa hitl", flush=True)
