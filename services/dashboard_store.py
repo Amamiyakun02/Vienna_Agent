@@ -25,6 +25,7 @@ from sqlalchemy import (
     inspect,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -291,6 +292,15 @@ def init_dashboard_db() -> bool:
                     "ALTER TABLE ai_providers ADD COLUMN is_default_admin "
                     "BOOLEAN NOT NULL DEFAULT FALSE"
                 )
+            )
+    # Kolom files di ai_turns (snapshot files[] hasil agent per
+    # giliran). IF NOT EXISTS membuatnya aman diulang walau inspect
+    # di atasnya membaca skema basi.
+    turn_cols = {c["name"] for c in inspect(_engine).get_columns("ai_turns")}
+    if "files" not in turn_cols:
+        with _engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE ai_turns ADD COLUMN IF NOT EXISTS files JSONB")
             )
     db = _Session()
     try:
@@ -905,6 +915,12 @@ class AiTurn(Base):
     tools_used = Column(JSON, nullable=False, default=list)
     status = Column(String(20), nullable=False, default="ok")
     duration_ms = Column(Integer, nullable=True)
+    # files[] hasil agent pada giliran ini — snapshot persis seperti
+    # yang dikirim ke klien di event done (name/path/size/content<=64KB
+    # atau content_omitted). NULL = giliran tanpa file. Disimpan di
+    # sini (bukan dibaca ulang dari disk) supaya kartu file di riwayat
+    # sesi awet walau file aslinya berubah/terhapus.
+    files = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
 
 
@@ -922,6 +938,7 @@ def record_ai_turn(
     tools_used: list[str],
     status: str,
     duration_ms: int | None,
+    files: list | None = None,
 ) -> None:
     """Tulis satu baris ai_turns. Membuka sesinya sendiri dan TIDAK
     PERNAH melempar — sama seperti record_ai_session_turn, pencatatan
@@ -945,11 +962,36 @@ def record_ai_turn(
                 tools_used=list(tools_used or []),
                 status=status or "ok",
                 duration_ms=duration_ms,
+                files=list(files) if files else None,
             )
         )
         db.commit()
     except Exception:
         db.rollback()
+    finally:
+        db.close()
+
+
+def list_ai_turn_files(session_id: str, role: str) -> list:
+    """files[] per giliran untuk satu sesi, urut kronologis (id naik).
+
+    Dipakai endpoint riwayat sesi untuk menempelkan kembali kartu
+    file ke pesan assistant-nya. Best-effort: kegagalan baca audit
+    mengembalikan [] (riwayat tetap tampil, tanpa kartu file).
+    """
+    if not session_id or _get_engine() is None:
+        return []
+    db = _Session()
+    try:
+        rows = (
+            db.query(AiTurn.files)
+            .filter(AiTurn.session_id == session_id, AiTurn.role == (role or "public"))
+            .order_by(AiTurn.id.asc())
+            .all()
+        )
+        return [r[0] for r in rows]
+    except Exception:
+        return []
     finally:
         db.close()
 

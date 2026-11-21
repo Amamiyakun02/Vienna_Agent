@@ -408,12 +408,15 @@ def _record_ai_turn_only(
     tools: list[str],
     status: str,
     duration_ms: int | None,
+    files: list | None = None,
 ) -> None:
     """Catat SATU giliran ke tabel ai_turns (termasuk giliran error).
 
     Pasangan _record_turn (yang mengurus ai_sessions kumulatif dan
     hanya berjalan untuk giliran sukses — perilakunya tidak diubah).
-    Sama-sama best-effort: tidak pernah melempar.
+    Sama-sama best-effort: tidak pernah melempar. files hanya diisi
+    pemanggil pada giliran sukses (snapshot yang sama dengan yang
+    dikirim ke klien), agar riwayat sesi bisa menampilkannya lagi.
     """
     try:
         from services import dashboard_store as _store
@@ -427,6 +430,7 @@ def _record_ai_turn_only(
             tools_used=tools,
             status=status,
             duration_ms=duration_ms,
+            files=files,
             **_usage_delta(start_usage, end_usage),
         )
     except Exception:
@@ -684,12 +688,48 @@ def _history_shape(raw: list) -> list:
     return out
 
 
+def _attach_turn_files(shaped: list, turn_files: list) -> None:
+    """Tempelkan files[] audit (ai_turns) ke pesan assistant terakhir
+    tiap giliran pada riwayat hasil _history_shape.
+
+    Pemetaan menurut urutan giliran: pesan user membuka giliran baru
+    dan baris ai_turns per sesi juga kronologis, jadi giliran ke-n
+    di riwayat berpasangan dengan baris ke-n. Satu giliran bisa
+    menghasilkan beberapa langkah assistant di serve — files selalu
+    menempel di langkah TERAKHIR giliran itu. Giliran tanpa file
+    (None/kosong) tidak mendapat field files sama sekali.
+    """
+    seg = -1
+    last_asst = None
+    for m in shaped:
+        if m["info"]["role"] == "user":
+            if last_asst is not None and 0 <= seg < len(turn_files) and turn_files[seg]:
+                last_asst["files"] = turn_files[seg]
+            seg += 1
+            last_asst = None
+        else:
+            last_asst = m
+    if last_asst is not None and 0 <= seg < len(turn_files) and turn_files[seg]:
+        last_asst["files"] = turn_files[seg]
+
+
 @router.get("/sessions/{session_id}/messages")
 async def session_messages(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", f"/api/session/{session_id}/message", base=base, pass_404=True)
-    return {"status": "success", "messages": _history_shape((data or {}).get("data", []))}
+    shaped = _history_shape((data or {}).get("data", []))
+    # Serve tidak menyimpan file hasil agent — snapshot-nya hidup di
+    # audit ai_turns (kolom files). Tempelkan kembali di sini supaya
+    # kartu file awet di riwayat; kegagalan baca audit tidak boleh
+    # menggagalkan riwayat itu sendiri.
+    try:
+        from services import dashboard_store as _store
+
+        _attach_turn_files(shaped, _store.list_ai_turn_files(session_id, role))
+    except Exception:
+        pass
+    return {"status": "success", "messages": shaped}
 
 
 @router.delete("/sessions/{session_id}")
@@ -872,10 +912,12 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         session_id, role, assistant.get("agent") or (body.agent or agent_default),
         model, admin_user, prompt_text, usage, tools,
     )
+    files = _collect_files(role, file_paths)
     _record_ai_turn_only(
         session_id, role, assistant.get("agent") or (body.agent or agent_default),
         model, admin_user, start_usage, usage, tools, "ok",
         int((time.monotonic() - started) * 1000),
+        files=files,
     )
     return {
         "status": "success",
@@ -884,7 +926,7 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         "tools_used": tools,
         "agent": assistant.get("agent"),
         "model": model,
-        "files": _collect_files(role, file_paths),
+        "files": files,
     }
 
 
@@ -960,11 +1002,12 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
         timeout = httpx.Timeout(deadline_s, connect=10.0)
         started = time.monotonic()
 
-        def _rec_turn(status: str) -> None:
+        def _rec_turn(status: str, files: list | None = None) -> None:
             _record_ai_turn_only(
                 session_id, role, body.agent or agent_default, model_id,
                 admin_user, start_usage, usage, tools_used, status,
                 int((time.monotonic() - started) * 1000),
+                files=files,
             )
         try:
             async with httpx.AsyncClient(base_url=base, auth=AUTH, timeout=timeout) as client:
@@ -1129,7 +1172,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
             session_id, role, body.agent or agent_default, model_id,
             admin_user, prompt_text, usage, tools_used,
         )
-        _rec_turn("ok")
+        _rec_turn("ok", files)
         yield _sse({
             "done": True,
             "session_id": session_id,
