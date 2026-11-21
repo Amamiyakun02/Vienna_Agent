@@ -70,6 +70,16 @@ PUBLIC_MAX_TURNS = int(os.getenv("OPENCODE_PUBLIC_MAX_TURNS", "30"))
 PUBLIC_MAX_SESSION_TOKENS = int(os.getenv("OPENCODE_PUBLIC_MAX_SESSION_TOKENS", "250000"))
 PUBLIC_MAX_TURN_TOKENS = int(os.getenv("OPENCODE_PUBLIC_MAX_TURN_TOKENS", "80000"))
 TIMEOUT_S = float(os.getenv("OPENCODE_TIMEOUT_S", "600"))
+# Tenggat role admin jauh lebih longgar: pekerjaan berkas yang sah bisa
+# melewati 10 menit, dan tenggat stream juga meng-abort giliran di
+# serve — jawaban yang ter-abort tidak pernah masuk riwayat sesi,
+# sehingga pemulihan riwayat oleh frontend pun tidak bisa menolong.
+TIMEOUT_S_ADMIN = float(os.getenv("OPENCODE_TIMEOUT_S_ADMIN", "1800"))
+
+
+def _deadline_s(role: str) -> float:
+    """Tenggat total satu giliran per role (detik)."""
+    return TIMEOUT_S_ADMIN if role == "admin" else TIMEOUT_S
 AUTH = ("opencode", PASSWORD) if PASSWORD else None
 
 
@@ -423,8 +433,14 @@ def _record_ai_turn_only(
         pass
 
 
-async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, **kwargs):
-    """Satu pintu ke opencode serve; error diterjemahkan ke HTTP backend."""
+async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = None, pass_404: bool = False, **kwargs):
+    """Satu pintu ke opencode serve; error diterjemahkan ke HTTP backend.
+
+    pass_404: untuk endpoint yang objeknya memang bisa tidak ada
+    (sesi yang sudah dihapus), 404 dari serve diteruskan sebagai 404
+    backend — bukan ditelan jadi 502 — supaya klien bisa membedakan
+    "memang tidak ada" dari "serve bermasalah".
+    """
     base_url = base or ADMIN_BASE_URL
     try:
         async with httpx.AsyncClient(base_url=base_url, auth=AUTH, timeout=timeout) as client:
@@ -435,6 +451,8 @@ async def _oc(method: str, path: str, timeout: float = 30.0, base: str | None = 
             detail=f"opencode serve tidak terjangkau di {base_url} — nyalakan instance opencode-core terkait ({exc})",
         )
     if resp.status_code >= 400:
+        if pass_404 and resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Sesi tidak ditemukan di opencode serve.")
         raise HTTPException(
             status_code=502,
             detail=f"opencode serve menjawab {resp.status_code}: {resp.text[:300]}",
@@ -631,7 +649,7 @@ async def create_session(body: SessionIn, role: str = "public", x_admin_token: s
 async def session_messages(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
-    data = await _oc("GET", f"/api/session/{session_id}/message", base=base)
+    data = await _oc("GET", f"/api/session/{session_id}/message", base=base, pass_404=True)
     return {"status": "success", "messages": (data or {}).get("data", [])}
 
 
@@ -759,7 +777,7 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": prompt_text}, base=base)
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
-        json={}, timeout=TIMEOUT_S, base=base,
+        json={}, timeout=_deadline_s(role), base=base,
     )
     data = await _oc("GET", f"/api/session/{session_id}/message", base=base)
     messages = sorted(
@@ -862,7 +880,8 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
     (ERR_INCOMPLETE_CHUNKED_ENCODING di frontend). Karena itu generator
     ini: (1) mengirim heartbeat komentar SSE tiap 15 dtk senyap supaya
     proxy tidak memutus aliran yang sah, (2) punya tenggat total
-    TIMEOUT_S lalu menutup dengan event error yang rapi, (3) menghentikan
+    per role (publik OPENCODE_TIMEOUT_S, admin OPENCODE_TIMEOUT_S_ADMIN)
+    lalu menutup dengan event error yang rapi, (3) menghentikan
     giliran seketika bila tool "question" muncul. Obat sebenarnya ada di
     config agent (agent serve dilarang memakai tool interaktif / effect
     "ask" — lihat opencode-core/), bukan di sini.
@@ -898,7 +917,8 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
         touched_paths: list[str] = []
         model_id: str | None = None
         usage = None
-        timeout = httpx.Timeout(TIMEOUT_S, connect=10.0)
+        deadline_s = _deadline_s(role)
+        timeout = httpx.Timeout(deadline_s, connect=10.0)
         started = time.monotonic()
 
         def _rec_turn(status: str) -> None:
@@ -965,11 +985,11 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                                 wait = max(0.1, 15.0 - (time.monotonic() - last_sent))
                                 item = await asyncio.wait_for(queue.get(), timeout=wait)
                             except asyncio.TimeoutError:
-                                if time.monotonic() - started > TIMEOUT_S:
+                                if time.monotonic() - started > deadline_s:
                                     await abort_best_effort()
-                                    print(f"[OPENCODE] timeout session={session_id} setelah {int(TIMEOUT_S)} dtk", flush=True)
+                                    print(f"[OPENCODE] timeout session={session_id} role={role} setelah {int(deadline_s)} dtk", flush=True)
                                     _rec_turn("error")
-                                    yield _sse({"error": f"agent tidak selesai dalam {int(TIMEOUT_S)} detik — giliran dihentikan"})
+                                    yield _sse({"error": f"agent tidak selesai dalam {int(deadline_s)} detik — giliran dihentikan"})
                                     return
                                 yield _out(": ping\n\n")  # heartbeat: jaga aliran dari timeout proxy
                                 continue
@@ -1097,7 +1117,7 @@ async def list_forms(session_id: str, role: str = "public", x_admin_token: str |
     """Form pertanyaan agent yang masih tertunda di sesi ini."""
     _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
-    data = await _oc("GET", f"/api/session/{session_id}/form", base=base)
+    data = await _oc("GET", f"/api/session/{session_id}/form", base=base, pass_404=True)
     return {"status": "success", "forms": (data or {}).get("data", [])}
 
 
@@ -1143,7 +1163,7 @@ async def list_permissions(session_id: str, role: str = "public", x_admin_token:
     """Permintaan persetujuan aksi yang masih tertunda di sesi ini."""
     _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
-    data = await _oc("GET", f"/api/session/{session_id}/permission", base=base)
+    data = await _oc("GET", f"/api/session/{session_id}/permission", base=base, pass_404=True)
     return {"status": "success", "permissions": (data or {}).get("data", [])}
 
 
