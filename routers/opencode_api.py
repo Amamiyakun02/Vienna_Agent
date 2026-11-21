@@ -635,6 +635,38 @@ async def session_messages(session_id: str, role: str = "public", x_admin_token:
     return {"status": "success", "messages": (data or {}).get("data", [])}
 
 
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
+    """Hapus sesi di opencode serve; riwayat chat-nya ikut hilang.
+
+    Audit Postgres (ai_sessions/ai_turns) SENGAJA tidak disentuh — itu
+    log audit, bukan riwayat chat. Jalur serve terverifikasi dari
+    OpenAPI-nya: DELETE /api/session/{id} -> 204; sesi tak dikenal ->
+    404, yang diteruskan sebagai 404 (bukan 502 seperti _oc, yang
+    memang untuk jalur data) supaya UI bisa membedakan "sudah hilang"
+    dari "serve bermasalah".
+    """
+    _admin_gate(role, x_admin_token)
+    _, base, _, _ = _target(role)
+    try:
+        async with httpx.AsyncClient(base_url=base, auth=AUTH, timeout=30.0) as client:
+            resp = await client.delete(f"/api/session/{session_id}")
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"opencode serve tidak terjangkau di {base} ({exc})",
+        )
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan di opencode serve.")
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"opencode serve menjawab {resp.status_code}: {resp.text[:300]}",
+        )
+    print(f"[OPENCODE] sesi dihapus session={session_id} role={role}", flush=True)
+    return {"status": "success"}
+
+
 @router.post("/chat/upload")
 async def chat_upload(
     role: str = "admin",
