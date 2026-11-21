@@ -645,12 +645,51 @@ async def create_session(body: SessionIn, role: str = "public", x_admin_token: s
     return {"status": "success", "session_id": session_id}
 
 
+def _strip_attachment_block(text: str) -> str:
+    """Buang blok konteks lampiran (ditambahkan _attachment_block ke
+    prompt) dari teks user untuk tampilan riwayat — frontend mencocokkan
+    riwayat dengan salinan lokalnya lewat teks asli user."""
+    marker = "\n\n[Berkas terlampir dari pengguna"
+    idx = text.find(marker)
+    return text[:idx].rstrip() if idx >= 0 else text
+
+
+def _history_shape(raw: list) -> list:
+    """Samakan riwayat sesi mentah serve dengan kontrak klien dashboard:
+    [{info: {role}, parts: [{type, text}]}] dalam urutan KRONOLOGIS.
+
+    Serve V2 mengembalikan pesan {type, content/text} dengan urutan
+    TERBARU dulu, diselingi pesan penanda "idle" dan langkah assistant
+    kosong — bentuk mentah itu tidak terbaca parser riwayat frontend
+    (info/parts kronologis), sehingga riwayat sesi tampil kosong.
+    Di sini: balik urutan, buang penanda & langkah kosong, petakan
+    user/assistant, sisakan part teks + reasoning assistant.
+    """
+    out = []
+    for m in reversed(raw or []):
+        t = m.get("type")
+        if t == "user":
+            text = _strip_attachment_block((m.get("text") or "").strip())
+            if text:
+                out.append({"info": {"role": "user"},
+                            "parts": [{"type": "text", "text": text}]})
+        elif t == "assistant":
+            parts = [
+                {"type": p.get("type"), "text": p.get("text")}
+                for p in (m.get("content") or [])
+                if p.get("type") in ("text", "reasoning") and (p.get("text") or "").strip()
+            ]
+            if parts:
+                out.append({"info": {"role": "assistant"}, "parts": parts})
+    return out
+
+
 @router.get("/sessions/{session_id}/messages")
 async def session_messages(session_id: str, role: str = "public", x_admin_token: str | None = Header(default=None)):
     _admin_gate(role, x_admin_token)
     _, base, _, _ = _target(role)
     data = await _oc("GET", f"/api/session/{session_id}/message", base=base, pass_404=True)
-    return {"status": "success", "messages": (data or {}).get("data", [])}
+    return {"status": "success", "messages": _history_shape((data or {}).get("data", []))}
 
 
 @router.delete("/sessions/{session_id}")
