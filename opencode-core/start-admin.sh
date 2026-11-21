@@ -36,6 +36,14 @@ cp "$BACKEND_DIR/opencode-core/shared-instructions/"*.md \
 if [ ! -d "$WORKSPACE_DIR/.git" ]; then
   git init -q "$WORKSPACE_DIR"
 fi
+# WAJIB: .data harus diabaikan repo workspace. Di dalamnya hidup
+# XDG_DATA_HOME opencode termasuk folder snapshot-nya sendiri;
+# tanpa baris ini snapshot menelan .data (dan dirinya sendiri)
+# tiap langkah sampai membengkak 47 GB dan menyumbat disk
+# (kejadian 21 Nov 2026: /home 100% penuh, giliran agent tertahan
+# menit-menit di git update-index snapshot).
+touch "$WORKSPACE_DIR/.gitignore"
+grep -qx '.data/' "$WORKSPACE_DIR/.gitignore" || echo '.data/' >> "$WORKSPACE_DIR/.gitignore"
 
 export OPENCODE_CONFIG="$BACKEND_DIR/opencode-core/admin/opencode.jsonc"
 # Pisahkan DB sesi admin dari sesi publik/pribadi:
