@@ -29,11 +29,14 @@ keluaran meniru SSE process_chat: {"text": ...} per potongan,
 import asyncio
 import json
 import os
+import re
+import shutil
 import time
+import uuid
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -193,6 +196,106 @@ def _collect_files(role: str, raw_paths: list[str]) -> list[dict]:
                 entry["content_omitted"] = "binary"
         out.append(entry)
     return out
+
+
+# --- Lampiran unggahan user untuk agent admin ----------------------------
+# Arah kebalikan files[]: user mengunggah berkas lewat POST
+# /chat/upload?role=admin; backend menyimpannya di uploads/<id>/ DI DALAM
+# ruang kerja admin, lalu id-nya dikirim kembali sebagai "attachments"
+# pada body chat — backend menambahkan blok konteks ke prompt supaya
+# agent membaca berkas itu dengan tool file-nya di giliran yang sama.
+# HANYA admin: pengunjung anonim tidak boleh menulis apa pun ke disk.
+UPLOAD_MAX_FILES = 5
+UPLOAD_MAX_FILE_BYTES = 10 * 1024 * 1024
+UPLOAD_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+_UPLOADS: dict[str, dict] = {}  # id -> {path, name, size, mime}
+
+
+def _safe_upload_name(name: str | None) -> str:
+    """Nama berkas aman untuk disk: basename saja, karakter aman."""
+    base = Path((name or "").replace("\\", "/")).name.strip()
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).lstrip(".")
+    return base or "file"
+
+
+def _resolve_upload(uid: str) -> Path | None:
+    """Path berkas unggahan dari id-nya; None bila tak dikenal.
+
+    Id wajib berformat uuid (sekaligus penahan path traversal).
+    Pemetaan utama in-memory; cadangan memindai folder uploads/<id>/
+    di disk supaya id tetap berlaku sesudah backend restart.
+    """
+    try:
+        uuid.UUID(str(uid))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    entry = _UPLOADS.get(str(uid))
+    if entry and Path(entry["path"]).is_file():
+        return Path(entry["path"])
+    root = _role_root("admin")
+    if root is None:
+        return None
+    folder = root / "uploads" / str(uid)
+    if folder.is_dir():
+        files = sorted(p for p in folder.iterdir() if p.is_file())
+        if files:
+            return files[0]
+    return None
+
+
+def _attachment_block(role: str, ids: list[str] | None) -> str:
+    """Blok konteks lampiran untuk prompt; "" bila tak ada yang sah.
+
+    Id tak dikenal diabaikan diam-diam (chat tidak boleh gagal hanya
+    karena satu lampiran basi), tapi tercatat di log backend.
+    """
+    if role != "admin" or not ids:
+        return ""
+    root = _role_root("admin")
+    if root is None:
+        return ""
+    lines = []
+    for uid in ids:
+        path = _resolve_upload(uid)
+        if path is None:
+            print(f"[OPENCODE] lampiran tak dikenal diabaikan: {uid}", flush=True)
+            continue
+        try:
+            rel = path.resolve().relative_to(root.resolve()).as_posix()
+        except Exception:
+            rel = f"uploads/{uid}/{path.name}"
+        lines.append(
+            f"[Berkas terlampir dari pengguna — tersimpan di ruang kerja: {rel}. "
+            "Baca berkas itu bila relevan dengan perintah.]"
+        )
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
+def _sweep_old_uploads() -> None:
+    """Hapus folder uploads/ berusia > 7 hari (jalan sekali saat startup).
+
+    Unggahan yatim (diunggah tapi tak pernah terkirim) tidak menumpuk
+    selamanya. Best-effort total: tidak boleh menggagalkan startup.
+    """
+    try:
+        root = _role_root("admin")
+        if root is None:
+            return
+        up = root / "uploads"
+        if not up.is_dir():
+            return
+        cutoff = time.time() - 7 * 86400
+        for child in up.iterdir():
+            try:
+                if child.is_dir() and child.stat().st_mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_sweep_old_uploads()
 
 
 def _admin_gate(role: str | None, x_admin_token: str | None) -> str | None:
@@ -360,6 +463,7 @@ class ChatIn(BaseModel):
     model: str | None = None  # format "providerID/modelID"; sesi lama disamakan modelnya
     hitl: bool = False  # True = klien bisa menjawab form/permission agent (lihat /chat/stream)
     role: str = "public"  # "public" (default, instance anonim) | "admin" (instance dashboard)
+    attachments: list[str] | None = None  # id unggahan dari POST /chat/upload (KHUSUS admin)
 
 
 class FormReplyIn(BaseModel):
@@ -531,6 +635,73 @@ async def session_messages(session_id: str, role: str = "public", x_admin_token:
     return {"status": "success", "messages": (data or {}).get("data", [])}
 
 
+@router.post("/chat/upload")
+async def chat_upload(
+    role: str = "admin",
+    files: list[UploadFile] = File(...),
+    x_admin_token: str | None = Header(default=None),
+):
+    """Unggah lampiran untuk agent ADMIN (multipart, field "files").
+
+    Berkas disimpan di uploads/<uuid>/ di dalam ruang kerja admin agar
+    tool file agent bisa membacanya pada giliran chat berikutnya (id
+    dikirim kembali lewat field "attachments" di body chat). Batas:
+    maks 5 berkas, 10 MB per berkas, 25 MB total — pelanggaran = 413
+    dan seluruh unggahan dibatalkan. Publik/anonim tidak dilayani.
+    """
+    if (role or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Lampiran hanya tersedia untuk role admin.")
+    _admin_gate("admin", x_admin_token)
+    root = _role_root("admin")
+    if root is None:
+        raise HTTPException(status_code=503, detail="Ruang kerja admin tidak tersedia di backend.")
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Terlalu banyak berkas (maksimal {UPLOAD_MAX_FILES} per unggahan).",
+        )
+    uploads_dir = root / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    out: list[dict] = []
+    total = 0
+    try:
+        for f in files:
+            uid = str(uuid.uuid4())
+            folder = uploads_dir / uid
+            folder.mkdir(parents=True, exist_ok=False)
+            created.append(folder)
+            dest = folder / _safe_upload_name(f.filename)
+            size = 0
+            with dest.open("wb") as fh:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > UPLOAD_MAX_FILE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Berkas '{f.filename}' melebihi batas 10 MB per berkas.",
+                        )
+                    if total > UPLOAD_MAX_TOTAL_BYTES:
+                        raise HTTPException(
+                            status_code=413, detail="Total unggahan melebihi batas 25 MB."
+                        )
+                    fh.write(chunk)
+            mime = f.content_type or "application/octet-stream"
+            shown = f.filename or dest.name
+            _UPLOADS[uid] = {"path": str(dest), "name": shown, "size": size, "mime": mime}
+            out.append({"id": uid, "name": shown, "size": size, "mime": mime})
+    except HTTPException:
+        for folder in created:
+            shutil.rmtree(folder, ignore_errors=True)
+        raise
+    print(f"[OPENCODE] unggah admin: {len(out)} berkas, total {total} byte", flush=True)
+    return {"files": out}
+
+
 @router.post("/chat")
 async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
     """Kirim prompt ke agent opencode dan tunggu jawaban finalnya.
@@ -547,12 +718,13 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         if limit_error:
             print(f"[OPENCODE] limit publik session={session_id}: {limit_error}", flush=True)
             return {"status": "error", "session_id": session_id, "response": "", "error": limit_error}
+    prompt_text = body.prompt + _attachment_block(role, body.attachments)
     started = time.monotonic()
     start_usage = {
         "cost": (session_data or {}).get("cost"),
         "tokens": (session_data or {}).get("tokens"),
     }
-    await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": body.prompt}, base=base)
+    await _oc("POST", f"/api/session/{session_id}/prompt", json={"text": prompt_text}, base=base)
     await _oc(
         "POST", f"/api/experimental/session/{session_id}/wait",
         json={}, timeout=TIMEOUT_S, base=base,
@@ -609,7 +781,7 @@ async def chat(body: ChatIn, x_admin_token: str | None = Header(default=None)):
         pass
     _record_turn(
         session_id, role, assistant.get("agent") or (body.agent or agent_default),
-        model, admin_user, body.prompt, usage, tools,
+        model, admin_user, prompt_text, usage, tools,
     )
     _record_ai_turn_only(
         session_id, role, assistant.get("agent") or (body.agent or agent_default),
@@ -680,6 +852,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
+    prompt_text = body.prompt + _attachment_block(role, body.attachments)
     turn_start_tokens = _tokens_total((session_data or {}).get("tokens")) if session_data else 0
     start_usage = {
         "cost": (session_data or {}).get("cost"),
@@ -716,7 +889,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
                         yield _sse({"error": f"opencode serve menjawab {resp.status_code} untuk /api/event"})
                         return
                     pr = await client.post(
-                        f"/api/session/{session_id}/prompt", json={"text": body.prompt}
+                        f"/api/session/{session_id}/prompt", json={"text": prompt_text}
                     )
                     if pr.status_code >= 400:
                         _rec_turn("error")
@@ -843,7 +1016,7 @@ async def chat_stream(body: ChatIn, x_admin_token: str | None = Header(default=N
         )
         _record_turn(
             session_id, role, body.agent or agent_default, model_id,
-            admin_user, body.prompt, usage, tools_used,
+            admin_user, prompt_text, usage, tools_used,
         )
         _rec_turn("ok")
         yield _sse({
