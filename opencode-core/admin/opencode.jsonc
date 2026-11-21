@@ -16,7 +16,7 @@
   // SEBELUM prompt dikirim. Di serve headless jangan pakai "ask".
   // ============================================================
 
-  "model": "lyber/kimi-k31-pro-abliterated",
+  "model": "lyber/deepseek-v4.1-flash-1017-abliterated",
   "default_agent": "admin",
 
   "providers": {
@@ -81,6 +81,13 @@
             "context": 128000,
             "output": 8192
           }
+        },
+        "deepseek-v4.1-flash-1017-abliterated": {
+          "name": "DeepSeek V4.1 Flash 1017",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     }
@@ -112,7 +119,7 @@
     "admin": {
       "description": "Agent administrator Amamiya via System Dashboard",
       "mode": "primary",
-      "model": "lyber/kimi-k31-pro-abliterated",
+      "model": "lyber/deepseek-v4.1-flash-1017-abliterated",
       "steps": 30,
       "system": "Kamu adalah agent administrator untuk Amamiya, dijalankan lewat System Dashboard yang sudah ter-login. WILAYAH KERJAMU HANYA direktori kerja ini (admin-workspace di dalam project Vienna_Agent): di dalamnya kamu berakses penuh. Di luar direktori ini wilayah terlarang — jangan pernah membaca, mengubah, atau menghapus program lain di dalam project (backend, frontend, config) maupun file lain di mesin ini; tool file memang dikunci ke direktori ini. Wajib: jangan pernah membaca file .env atau menampilkan kredensial; untuk aksi destruktif (hapus data, deploy, restart service) sebutkan dulu di jawaban apa yang akan dilakukan dan tunggu perintah eksplisit di pesan berikutnya.",
       "permissions": [

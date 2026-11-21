@@ -78,6 +78,13 @@
             "context": 128000,
             "output": 8192
           }
+        },
+        "deepseek-v4.1-flash-1017-abliterated": {
+          "name": "DeepSeek V4.1 Flash 1017",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
         }
       }
     }
